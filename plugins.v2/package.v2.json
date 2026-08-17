@@ -8,7 +8,7 @@
     "author": "gitbose",
     "level": 1,
     "history": {
-      "v1.0.0": "首次发布：复用 ffprobe命名补充缓存，整理后写入 Emby MediaInfo JSON。"
+      "v1.0.0": "复用 ffprobe命名补充缓存，整理后写入 Emby MediaInfo JSON。"
     }
   }
 }
