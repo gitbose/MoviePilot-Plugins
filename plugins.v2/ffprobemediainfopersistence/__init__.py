@@ -43,7 +43,7 @@ class FFprobeMediaInfoPersistence(_PluginBase):
     plugin_name = "ffprobe媒体信息持久化"
     plugin_desc = "复用 ffprobe命名补充的媒体信息并持久化为 Emby MediaInfo JSON。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/refs/heads/main/icons/ffmpeg.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     plugin_author = "gitbose"
     author_url = "https://github.com/gitbose"
     plugin_config_prefix = "ffprobemediainfopersistence_"
@@ -175,8 +175,8 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         }
 
     def get_page(self) -> Optional[List[dict]]:
-        """不提供详情页，沿用 MP 的卡片点击直达配置页行为。"""
-        return None
+        # 与 ffprobe命名补充保持一致：不定义独立详情页。
+        pass
 
     def stop_service(self) -> None:
         type(self)._clear_pending_cache()
