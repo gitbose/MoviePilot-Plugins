@@ -110,6 +110,7 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         if not self._enabled:
             type(self)._clear_pending_cache()
             self._stop_background_tasks()
+            logger.info("【ffprobe媒体信息持久化】插件未启用，不监听整理事件")
         elif workers_changed and self._fallback_executor is not None:
             self._stop_background_tasks()
             self._fallback_executor = ThreadPoolExecutor(
@@ -120,6 +121,14 @@ class FFprobeMediaInfoPersistence(_PluginBase):
             self._fallback_executor = ThreadPoolExecutor(
                 max_workers=self._fallback_workers,
                 thread_name_prefix="ffprobe-media-info",
+            )
+        if self._enabled:
+            logger.info(
+                "【ffprobe媒体信息持久化】插件已启用：主动提取=%s，并发=%s，超时=%s 秒，清理孤立 JSON=%s",
+                self._fallback_probe,
+                self._fallback_workers,
+                self._fallback_timeout,
+                self._cleanup_moved_source_json,
             )
 
     def get_state(self) -> bool:
@@ -273,13 +282,14 @@ class FFprobeMediaInfoPersistence(_PluginBase):
     def _background_probe_and_persist(self, destination: Path) -> None:
         """对已整理到位的目标文件执行一次 10 秒兜底探测并写入 JSON。"""
         if not destination.is_file():
-            logger.debug("【ffprobe媒体信息持久化】后台提取时目标不存在，跳过：%s", destination)
+            logger.warning("【ffprobe媒体信息持久化】后台提取时目标不存在，跳过：%s", destination)
             return
+        logger.info("【ffprobe媒体信息持久化】开始后台 ffprobe：%s", destination)
         probe = type(self)._run_fallback_ffprobe(
             str(destination), self._fallback_timeout
         )
         if not isinstance(probe, dict):
-            logger.debug("【ffprobe媒体信息持久化】后台 ffprobe 未得到结果，跳过：%s", destination)
+            logger.warning("【ffprobe媒体信息持久化】后台 ffprobe 未得到结果，跳过：%s", destination)
             return
         self._persist(destination, probe)
 
@@ -520,21 +530,26 @@ class FFprobeMediaInfoPersistence(_PluginBase):
             return
         data = event.event_data
         if not isinstance(data, TransferRenameBuildEventData):
+            logger.warning("【ffprobe媒体信息持久化】收到非预期的重命名构建事件数据，跳过")
             return
         source_item: Optional[FileItem] = data.source_item
         source_path = str(data.source_path or "").strip()
         if not source_path or not source_item or source_item.storage != "local":
+            logger.warning("【ffprobe媒体信息持久化】重命名构建事件缺少本地源文件，跳过")
             return
         if not type(self)._is_media_path(source_path):
+            logger.info("【ffprobe媒体信息持久化】源文件不是受支持媒体类型，跳过：%s", source_path)
             return
+        logger.info("【ffprobe媒体信息持久化】收到重命名构建事件：%s", source_path)
         destination = type(self)._destination_path(data)
         transfer_method = type(self)._transfer_method(data)
         # 如果此时已有目标路径，先筛选再读取缓存，避免无用处理。
         if destination is not None and not self._matches_filters(destination, transfer_method):
+            logger.info("【ffprobe媒体信息持久化】不符合生成 JSON 筛选条件，跳过：%s", source_path)
             return
         probe = type(self)._get_cached_probe(source_path)
         if probe is None:
-            logger.debug(
+            logger.info(
                 "【ffprobe媒体信息持久化】未命中上游 ffprobe 缓存，等待整理完成后按配置决定是否后台兜底 source=%s",
                 source_path,
             )
@@ -546,6 +561,7 @@ class FFprobeMediaInfoPersistence(_PluginBase):
                 "transfer_method": transfer_method,
             },
         )
+        logger.info("【ffprobe媒体信息持久化】已复用上游 ffprobe 缓存：%s", source_path)
 
     @eventmanager.register(EventType.TransferComplete)
     def on_transfer_complete(self, event: Event) -> None:
@@ -556,13 +572,16 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         destination = type(self)._destination_path(data)
         source_path = type(self)._source_path(data)
         if destination is None or source_path is None:
-            logger.debug("【ffprobe媒体信息持久化】整理完成事件缺少源或目标路径，跳过")
+            logger.warning("【ffprobe媒体信息持久化】整理完成事件缺少源或目标路径，跳过")
             return
         if not type(self)._is_media_path(source_path):
+            logger.info("【ffprobe媒体信息持久化】整理完成事件的源文件不是受支持媒体类型，跳过：%s", source_path)
             return
+        logger.info("【ffprobe媒体信息持久化】收到整理完成事件：%s -> %s", source_path, destination)
         transfer_method = type(self)._transfer_method(data)
         try:
             if not self._matches_filters(destination, transfer_method):
+                logger.info("【ffprobe媒体信息持久化】目标不符合生成 JSON 筛选条件，跳过：%s", destination)
                 return
             pending = type(self)._pending_probe_cache.get(type(self)._cache_key(source_path))
             probe = pending.get("probe") if isinstance(pending, dict) else None
@@ -572,23 +591,28 @@ class FFprobeMediaInfoPersistence(_PluginBase):
             if not isinstance(probe, dict):
                 if self._fallback_probe:
                     self._submit_fallback_task(destination)
-                    logger.info("【ffprobe媒体信息持久化】未命中上游缓存，已提交后台 ffprobe（10 秒超时）：%s", destination)
+                    logger.info(
+                        "【ffprobe媒体信息持久化】未命中上游缓存，已提交后台 ffprobe（%s 秒超时）：%s",
+                        self._fallback_timeout,
+                        destination,
+                    )
                 else:
-                    logger.debug("【ffprobe媒体信息持久化】没有可复用的 ffprobe 结果，跳过：%s", destination)
+                    logger.warning("【ffprobe媒体信息持久化】没有可复用的 ffprobe 结果，跳过：%s", destination)
                 return
             # 命中缓存的 JSON 写入不受 ffprobe 兜底线程数限制；每条整理记录自行完成。
             self._submit_cached_persist(destination, probe)
+            logger.info("【ffprobe媒体信息持久化】已提交缓存 JSON 写入：%s", destination)
         finally:
             # 清理放在该条整理记录的处理末尾；不受生成 JSON 筛选条件影响。
             self._schedule_source_json_cleanup(source_path)
 
     def _persist(self, destination: Path, probe: Dict[str, Any]) -> None:
         if not destination.is_file():
-            logger.debug("【ffprobe媒体信息持久化】整理目标不存在，跳过：%s", destination)
+            logger.warning("【ffprobe媒体信息持久化】整理目标不存在，跳过：%s", destination)
             return
         json_path = destination.with_name(destination.stem + _MEDIA_INFO_SUFFIX)
         if json_path.exists() and not self._overwrite_json:
-            logger.debug("【ffprobe媒体信息持久化】JSON 已存在，不覆盖：%s", json_path)
+            logger.info("【ffprobe媒体信息持久化】JSON 已存在，按配置不覆盖：%s", json_path)
             return
         try:
             document = type(self)._to_emby_document(probe)
