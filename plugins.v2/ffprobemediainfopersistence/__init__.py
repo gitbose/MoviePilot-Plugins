@@ -330,6 +330,22 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         return None
 
     @classmethod
+    def _event_snapshot(cls, data: Any) -> str:
+        """仅在事件字段不兼容时输出数据结构，便于适配不同 MP 版本。"""
+        try:
+            if hasattr(data, "model_dump"):
+                value = data.model_dump(exclude_none=True)
+            elif hasattr(data, "dict"):
+                value = data.dict(exclude_none=True)
+            elif isinstance(data, dict):
+                value = data
+            else:
+                value = vars(data)
+            return repr(value)[:4000]
+        except Exception:
+            return repr(data)[:1000]
+
+    @classmethod
     def _event_transfer_info(cls, data: Any) -> Any:
         return cls._value(data, ("transferinfo", "transfer_info")) or data
 
@@ -572,7 +588,11 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         destination = type(self)._destination_path(data)
         source_path = type(self)._source_path(data)
         if destination is None or source_path is None:
-            logger.warning("【ffprobe媒体信息持久化】整理完成事件缺少源或目标路径，跳过")
+            logger.warning(
+                "【ffprobe媒体信息持久化】整理完成事件缺少源或目标路径，跳过。"
+                "event_data=%s",
+                type(self)._event_snapshot(data),
+            )
             return
         if not type(self)._is_media_path(source_path):
             logger.info("【ffprobe媒体信息持久化】整理完成事件的源文件不是受支持媒体类型，跳过：%s", source_path)
