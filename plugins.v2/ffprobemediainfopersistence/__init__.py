@@ -133,22 +133,16 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         return []
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
-        """使用 VSelect，避免部分 V2 前端无法保存 VRadioGroup 的选择。"""
+        """按整理流程排序的五行紧凑配置页。"""
         return [{"component": "VForm", "content": [
             {"component": "VRow", "content": [
-                {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
                     {"component": "VSwitch", "props": {
                         "model": "enabled", "label": "启用插件",
                         "hint": "开启后监听媒体整理事件并写入 MediaInfo JSON。",
                         "persistent-hint": True,
                     }}]},
-                {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                    {"component": "VSwitch", "props": {
-                        "model": "overwrite_json", "label": "覆盖同名 MediaInfo JSON",
-                        "hint": "关闭时保留目标目录中已有的同名 JSON。",
-                        "persistent-hint": True,
-                    }}]},
-                {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
                     {"component": "VSwitch", "props": {
                         "model": "cleanup_moved_source_json", "label": "清理已搬离源文件的同名 MediaInfo JSON",
                         "hint": "整理完成 5 秒后，源文件仍不存在则删除源目录严格同名的 JSON。",
@@ -162,34 +156,50 @@ class FFprobeMediaInfoPersistence(_PluginBase):
                         "hint": "仅缓存未命中时，对整理后的目标文件执行 ffprobe；任务在后台运行。",
                         "persistent-hint": True,
                     }}]},
-                {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
-                    {"component": "VTextField", "props": {
-                        "model": "fallback_workers", "label": "兜底提取并发数",
-                        "type": "number", "min": 1, "max": 10,
-                        "hint": "范围 1–10；仅限制兜底 ffprobe。",
+                {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                    {"component": "VSwitch", "props": {
+                        "model": "overwrite_json", "label": "覆盖同名 JSON",
+                        "hint": "关闭时保留目标目录中已有的同名 JSON。",
                         "persistent-hint": True,
                     }}]},
-                {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
+            ]},
+            {"component": "VRow", "content": [
+                {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
                     {"component": "VTextField", "props": {
-                        "model": "fallback_timeout", "label": "兜底提取超时（秒）",
+                        "model": "fallback_workers", "label": "主动提取并发数",
+                        "type": "number", "min": 1, "max": 10,
+                        "hint": "范围 1–10；仅限制缓存缺失时的 ffprobe。",
+                        "persistent-hint": True,
+                    }}]},
+                {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                    {"component": "VTextField", "props": {
+                        "model": "fallback_timeout", "label": "主动提取超时（秒）",
                         "type": "number", "min": 1, "max": 300,
                         "hint": "默认 10 秒，范围 1–300 秒。",
                         "persistent-hint": True,
                     }}]},
+                {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                    {"component": "VSelect", "props": {
+                        "model": "filter_match_mode", "label": "生成 JSON 匹配条件",
+                        "items": [
+                            {"title": "同时匹配", "value": "all"},
+                            {"title": "任一匹配", "value": "any"},
+                        ],
+                        "hint": "同时匹配：所有已填写条件都命中；任一匹配：任意一项已填写条件命中。",
+                        "persistent-hint": True,
+                    }}]},
             ]},
-            {"component": "VSelect", "props": {"model": "filter_match_mode", "label": "筛选条件关系", "items": [
-                {"title": "同时匹配", "value": "all"},
-                {"title": "任一匹配", "value": "any"},
-            ], "hint": "同时匹配：所有已填写条件都命中，留空项视为满足；任一匹配：任意一项已填写条件命中。", "persistent-hint": True}},
             {"component": "VRow", "content": [
-                {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                {"component": "VCol", "props": {"cols": 12}, "content": [
                     {"component": "VTextarea", "props": {
                         "model": "transfer_methods", "label": "限定整理方式（可选，一行一个）",
                         "placeholder": "复制\n移动\n硬链接\n软链接", "rows": 3,
                         "hint": "可填写：复制、移动、硬链接、软链接。留空表示不限制整理方式。",
                         "persistent-hint": True,
                     }}]},
-                {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+            ]},
+            {"component": "VRow", "content": [
+                {"component": "VCol", "props": {"cols": 12}, "content": [
                     {"component": "VTextarea", "props": {
                         "model": "destination_roots", "label": "限定整理目标路径（可选，一行一个）",
                         "placeholder": "/media/电影\n/media/剧集", "rows": 3,
@@ -197,7 +207,7 @@ class FFprobeMediaInfoPersistence(_PluginBase):
                         "persistent-hint": True,
                     }}]},
             ]},
-            {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "density": "compact", "text": "缓存命中后会立即后台写入 JSON；缓存缺失时按设置后台兜底提取。源文件整理完成后延迟 5 秒检查，若源文件已不存在则清理其严格同名的 -mediainfo.json。"}},
+            {"component": "VAlert", "props": {"type": "warning", "variant": "tonal", "density": "compact", "text": "使用说明：优先复用“ffprobe命名补充”已获取的缓存，缓存命中后立即后台写入 JSON，不限制写入线程。仅缓存缺失时才按“主动提取”配置对最终目标文件运行 ffprobe。源文件整理完成后延迟 5 秒检查，若源文件已不存在则清理源目录严格同名的 -mediainfo.json。上游 ffprobe 未请求章节，因此输出 JSON 的 Chapters 为空。"}},
         ]}], {
             "enabled": False,
             "overwrite_json": False,
