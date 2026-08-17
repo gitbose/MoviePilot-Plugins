@@ -28,7 +28,7 @@ _MEDIA_INFO_SUFFIX = "-mediainfo.json"
 _DOVI_TAGS = frozenset({"dvh1", "dvhe", "dva1", "dvav"})
 _DEFAULT_FALLBACK_FFPROBE_TIMEOUT_SEC = 10
 _MAX_FALLBACK_FFPROBE_TIMEOUT_SEC = 300
-_SOURCE_JSON_CLEANUP_DELAY_SEC = 5
+_SOURCE_JSON_CLEANUP_DELAY_SEC = 10
 _TRANSFER_METHOD_ALIASES = {
     "复制": "copy", "copy": "copy",
     "移动": "move", "move": "move",
@@ -145,7 +145,7 @@ class FFprobeMediaInfoPersistence(_PluginBase):
                 {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
                     {"component": "VSwitch", "props": {
                         "model": "cleanup_moved_source_json", "label": "清理已搬离源文件的同名 MediaInfo JSON",
-                        "hint": "整理完成 5 秒后，源文件仍不存在则删除源目录严格同名的 JSON。",
+                        "hint": "整理完成 10 秒后，媒体文件若被删除，则删除同目录下严格同名的 JSON 文件。",
                         "persistent-hint": True,
                     }}]},
             ]},
@@ -168,7 +168,7 @@ class FFprobeMediaInfoPersistence(_PluginBase):
                     {"component": "VTextField", "props": {
                         "model": "fallback_workers", "label": "主动提取并发数",
                         "type": "number", "min": 1, "max": 10,
-                        "hint": "范围 1–10；仅限制缓存缺失时的 ffprobe。",
+                        "hint": "范围 1–10；驱动为网盘时不建议设置过大。",
                         "persistent-hint": True,
                     }}]},
                 {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
@@ -207,7 +207,8 @@ class FFprobeMediaInfoPersistence(_PluginBase):
                         "persistent-hint": True,
                     }}]},
             ]},
-            {"component": "VAlert", "props": {"type": "warning", "variant": "tonal", "density": "compact", "text": "使用说明：优先复用“ffprobe命名补充”已获取的缓存，缓存命中后立即后台写入 JSON，不限制写入线程。仅缓存缺失时才按“主动提取”配置对最终目标文件运行 ffprobe。源文件整理完成后延迟 5 秒检查，若源文件已不存在则清理源目录严格同名的 -mediainfo.json。上游 ffprobe 未请求章节，因此输出 JSON 的 Chapters 为空。"}},
+            {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "density": "compact", "text": "使用说明：优先复用“ffprobe命名补充”已获取的缓存，缓存命中后立即后台写入 JSON，不限制写入线程。仅缓存缺失时才按“主动提取”配置对最终目标文件运行 ffprobe。上游 ffprobe 未请求章节，因此输出 JSON 的 Chapters 为空。"}},
+            {"component": "VAlert", "props": {"type": "warning", "variant": "tonal", "density": "compact", "text": "JSON清理：文件整理完成后延迟 10 秒检查，若媒体文件已不存在，则清理媒体文件目录下严格同名的 -mediainfo.json 文件。"}},
         ]}], {
             "enabled": False,
             "overwrite_json": False,
@@ -399,7 +400,7 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         return Path(path).suffix.lower() in settings.RMT_MEDIAEXT
 
     def _schedule_source_json_cleanup(self, source_path: str) -> None:
-        """给源文件刷新留出 5 秒窗口，再判断是否需要清理孤立 JSON。"""
+        """给媒体文件刷新留出 10 秒窗口，再判断是否需要清理孤立 JSON。"""
         if not self._cleanup_moved_source_json:
             return
         timer: Timer
@@ -579,7 +580,6 @@ class FFprobeMediaInfoPersistence(_PluginBase):
             self._submit_cached_persist(destination, probe)
         finally:
             # 清理放在该条整理记录的处理末尾；不受生成 JSON 筛选条件影响。
-            # 无论本次写入成功、已存在、被筛选或探测失败，都会执行一次安全检查。
             self._schedule_source_json_cleanup(source_path)
 
     def _persist(self, destination: Path, probe: Dict[str, Any]) -> None:
