@@ -11,7 +11,7 @@ import re
 import sys
 from concurrent.futures import Future, ThreadPoolExecutor
 from subprocess import TimeoutExpired, run
-from threading import Lock, Thread
+from threading import Lock, Thread, Timer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Type
 
@@ -28,6 +28,7 @@ _MEDIA_INFO_SUFFIX = "-mediainfo.json"
 _DOVI_TAGS = frozenset({"dvh1", "dvhe", "dva1", "dvav"})
 _DEFAULT_FALLBACK_FFPROBE_TIMEOUT_SEC = 10
 _MAX_FALLBACK_FFPROBE_TIMEOUT_SEC = 300
+_SOURCE_JSON_CLEANUP_DELAY_SEC = 5
 _TRANSFER_METHOD_ALIASES = {
     "复制": "copy", "copy": "copy",
     "移动": "move", "move": "move",
@@ -71,6 +72,8 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         self._fallback_executor: Optional[ThreadPoolExecutor] = None
         self._fallback_tasks: set[Future] = set()
         self._fallback_tasks_lock = Lock()
+        self._cleanup_timers: set[Timer] = set()
+        self._cleanup_timers_lock = Lock()
 
     def init_plugin(self, config: dict = None) -> None:
         config = config or {}
@@ -130,190 +133,36 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         return []
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
-        return [
-            {
-                "component": "VForm",
-                "content": [
-                    {
-                        "component": "VRow",
-                        "props": {"class": "mb-2"},
-                        "content": [{
-                            "component": "VCol",
-                            "props": {"cols": 12},
-                            "content": [{
-                                "component": "VSwitch",
-                                "props": {"model": "enabled", "label": "启用插件"},
-                            }],
-                        }],
-                    },
-                    {
-                        "component": "VRow",
-                        "props": {"class": "mb-2"},
-                        "content": [{
-                            "component": "VCol",
-                            "props": {"cols": 12},
-                            "content": [{
-                                "component": "VSwitch",
-                                "props": {
-                                    "model": "cleanup_moved_source_json",
-                                    "label": "清理已搬离源文件的同名 MediaInfo JSON",
-                                    "hint": "重新整理完成后，若源媒体已不存在且源、目标路径不同，则删除源目录严格同名的 -mediainfo.json。复制、硬链接或源文件仍存在时不会删除。",
-                                    "persistent-hint": True,
-                                },
-                            }],
-                        }],
-                    },
-                    {
-                        "component": "VRow",
-                        "props": {"class": "mb-2"},
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 8},
-                                "content": [{
-                                    "component": "VSwitch",
-                                    "props": {
-                                        "model": "fallback_probe",
-                                        "label": "上游缓存缺失时主动提取（10 秒超时）",
-                                        "hint": "关闭后仅复用 ffprobe命名补充的缓存；开启后仅在缓存未命中时，对整理后的目标文件执行一次 ffprobe。",
-                                        "persistent-hint": True,
-                                    },
-                                }],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [{
-                                    "component": "VTextField",
-                                    "props": {
-                                        "model": "fallback_workers",
-                                        "label": "兜底提取并发数",
-                                        "type": "number",
-                                        "min": 1,
-                                        "max": 10,
-                                        "hint": "仅限制主动提取；缓存命中写入不受限制。",
-                                        "persistent-hint": True,
-                                    },
-                                }],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [{
-                                    "component": "VTextField",
-                                    "props": {
-                                        "model": "fallback_timeout",
-                                        "label": "兜底提取超时（秒）",
-                                        "type": "number",
-                                        "min": 1,
-                                        "max": 300,
-                                        "hint": "默认 10 秒，最大 300 秒。",
-                                        "persistent-hint": True,
-                                    },
-                                }],
-                            },
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "props": {"class": "mb-2"},
-                        "content": [{
-                            "component": "VCol",
-                            "props": {"cols": 12},
-                            "content": [{
-                                "component": "VSelect",
-                                "props": {
-                                    "model": "filter_match_mode",
-                                    "label": "筛选条件关系",
-                                    "items": [
-                                        {"title": "同时匹配", "value": "all"},
-                                        {"title": "任一匹配", "value": "any"},
-                                    ],
-                                    "hint": "同时匹配：所有已填写条件均须命中，留空项视为满足；任一匹配：至少一个已填写条件命中即可，留空项不参与匹配。",
-                                    "persistent-hint": True,
-                                },
-                            }],
-                        }],
-                    },
-                    {
-                        "component": "VRow",
-                        "props": {"class": "mb-2"},
-                        "content": [{
-                            "component": "VCol",
-                            "props": {"cols": 12},
-                            "content": [{
-                                "component": "VTextarea",
-                                "props": {
-                                    "model": "transfer_methods",
-                                    "label": "限定整理方式（可选，一行一个）",
-                                    "placeholder": "复制\n移动\n硬链接\n软链接",
-                                    "hint": "留空表示不按整理方式过滤。填写后，只有整理方式与其中任一项一致才生成 JSON。",
-                                    "persistent-hint": True,
-                                    "rows": 4,
-                                },
-                            }],
-                        }],
-                    },
-                    {
-                        "component": "VRow",
-                        "props": {"class": "mb-2"},
-                        "content": [{
-                            "component": "VCol",
-                            "props": {"cols": 12},
-                            "content": [{
-                                "component": "VTextarea",
-                                "props": {
-                                    "model": "destination_roots",
-                                    "label": "限定整理目标路径（可选，一行一个）",
-                                    "placeholder": "/media/电影\n/media/剧集",
-                                    "hint": "留空表示不按目标路径过滤。填写后，只有最终媒体路径位于其中任一目录下才生成 JSON。请填写 MoviePilot 容器内路径。",
-                                    "persistent-hint": True,
-                                    "rows": 3,
-                                },
-                            }],
-                        }],
-                    },
-                    {
-                        "component": "VRow",
-                        "props": {"class": "mb-2"},
-                        "content": [{
-                            "component": "VCol",
-                            "props": {"cols": 12},
-                            "content": [{
-                                "component": "VSwitch",
-                                "props": {"model": "overwrite_json", "label": "覆盖同名 MediaInfo JSON"},
-                            }],
-                        }],
-                    },
-                    {
-                        "component": "VAlert",
-                        "props": {
-                            "type": "warning",
-                            "variant": "tonal",
-                            "density": "compact",
-                            "text": (
-                                "优先复用“ffprobe命名补充”插件缓存。若缓存缺失且已开启兜底，"
-                                "本插件会在整理完成后按设定线程数执行一次 ffprobe，"
-                                "单个任务最长 10 秒；超时或失败则跳过。缓存命中时不受此并发数限制。"
-                            ),
-                        },
-                    },
-                    {
-                        "component": "VAlert",
-                        "props": {
-                            "type": "info",
-                            "variant": "tonal",
-                            "density": "compact",
-                            "text": (
-                                "JSON 写入整理后媒体文件同目录，文件名为 "
-                                "<媒体文件名>-mediainfo.json。由于上游 ffprobe 没有请求章节，"
-                                "本插件不会额外读取章节，JSON 中 Chapters 固定为空。"
-                            ),
-                        },
-                    },
-                ],
-            }
-        ], {
+        """紧凑双列布局；单选组避免部分 MP 版本的 VSelect 无法操作。"""
+        return [{"component": "VForm", "content": [
+            {"component": "VRow", "content": [
+                {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                    {"component": "VSwitch", "props": {"model": "enabled", "label": "启用插件"}}]},
+                {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                    {"component": "VSwitch", "props": {"model": "overwrite_json", "label": "覆盖同名 MediaInfo JSON"}}]},
+                {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                    {"component": "VSwitch", "props": {"model": "cleanup_moved_source_json", "label": "清理已搬离源文件的同名 MediaInfo JSON"}}]},
+            ]},
+            {"component": "VRow", "content": [
+                {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                    {"component": "VSwitch", "props": {"model": "fallback_probe", "label": "上游缓存缺失时主动提取"}}]},
+                {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
+                    {"component": "VTextField", "props": {"model": "fallback_workers", "label": "兜底提取并发数", "type": "number", "min": 1, "max": 10}}]},
+                {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
+                    {"component": "VTextField", "props": {"model": "fallback_timeout", "label": "兜底提取超时（秒）", "type": "number", "min": 1, "max": 300}}]},
+            ]},
+            {"component": "VRadioGroup", "props": {"model": "filter_match_mode", "label": "筛选条件关系", "inline": true}, "content": [
+                {"component": "VRadio", "props": {"label": "同时匹配", "value": "all"}},
+                {"component": "VRadio", "props": {"label": "任一匹配", "value": "any"}},
+            ]},
+            {"component": "VRow", "content": [
+                {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                    {"component": "VTextarea", "props": {"model": "transfer_methods", "label": "限定整理方式（可选，一行一个）", "placeholder": "复制\n移动\n硬链接\n软链接", "rows": 3, "hint": "留空表示不限制整理方式。"}}]},
+                {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                    {"component": "VTextarea", "props": {"model": "destination_roots", "label": "限定整理目标路径（可选，一行一个）", "placeholder": "/media/电影\n/media/剧集", "rows": 3, "hint": "留空表示不限制目标路径；填写容器内路径。"}}]},
+            ]},
+            {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "density": "compact", "text": "缓存命中后会立即后台写入 JSON；缓存缺失时按设置后台兜底提取。源文件整理完成后延迟 5 秒检查，若源文件已不存在则清理其严格同名的 -mediainfo.json。"}},
+        ]}], {
             "enabled": False,
             "overwrite_json": False,
             "fallback_probe": True,
@@ -326,16 +175,8 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         }
 
     def get_page(self) -> Optional[List[dict]]:
-        return [
-            {
-                "component": "VAlert",
-                "props": {
-                    "type": "info",
-                    "variant": "tonal",
-                    "text": "本插件在媒体整理时运行：优先复用 ffprobe命名补充已获取的媒体信息，后台写入同目录的 -mediainfo.json；缓存缺失时，可按设置对最终目标文件进行 10 秒兜底提取。详情请在插件配置页查看筛选条件与开关。",
-                },
-            }
-        ]
+        """不提供详情页，沿用 MP 的卡片点击直达配置页行为。"""
+        return None
 
     def stop_service(self) -> None:
         type(self)._clear_pending_cache()
@@ -349,6 +190,10 @@ class FFprobeMediaInfoPersistence(_PluginBase):
             executor.shutdown(wait=False, cancel_futures=True)
         with self._fallback_tasks_lock:
             self._fallback_tasks.clear()
+        with self._cleanup_timers_lock:
+            for timer in self._cleanup_timers:
+                timer.cancel()
+            self._cleanup_timers.clear()
 
     def _submit_cached_persist(self, destination: Path, probe: Dict[str, Any]) -> None:
         """每个缓存命中的文件直接启动写入线程，不参与 ffprobe 兜底限流。"""
@@ -507,29 +352,40 @@ class FFprobeMediaInfoPersistence(_PluginBase):
     def _is_media_path(path: str) -> bool:
         return Path(path).suffix.lower() in settings.RMT_MEDIAEXT
 
-    def _cleanup_source_json(self, source_path: str, destination: Path) -> None:
-        """仅清理已被移动走的源媒体严格同名的持久化 JSON。"""
+    def _schedule_source_json_cleanup(self, source_path: str) -> None:
+        """给源文件刷新留出 5 秒窗口，再判断是否需要清理孤立 JSON。"""
         if not self._cleanup_moved_source_json:
             return
-        source = Path(source_path)
+        timer: Timer
+
+        def cleanup_task() -> None:
+            try:
+                self._cleanup_source_json(source_path)
+            finally:
+                with self._cleanup_timers_lock:
+                    self._cleanup_timers.discard(timer)
+
+        timer = Timer(_SOURCE_JSON_CLEANUP_DELAY_SEC, cleanup_task)
+        timer.daemon = True
+        with self._cleanup_timers_lock:
+            self._cleanup_timers.add(timer)
+        timer.start()
+
+    def _cleanup_source_json(self, source_path: str) -> None:
+        """源文件在延迟检查时不存在，就删除严格同名的持久化 JSON。"""
         try:
-            if source.resolve() == destination.resolve():
+            if not self._cleanup_moved_source_json:
                 return
-        except OSError:
-            # 无法解析路径时仍可用字符串比较避免相同路径误删。
-            if str(source).replace("\\", "/").casefold() == str(destination).replace("\\", "/").casefold():
+            source = Path(source_path)
+            if source.exists():
                 return
-        # 源文件还存在时，它可能来自复制或硬链接整理，绝不可删对应 JSON。
-        if source.exists():
-            return
-        source_json = source.with_name(source.stem + _MEDIA_INFO_SUFFIX)
-        if not source_json.is_file():
-            return
-        try:
+            source_json = source.with_name(source.stem + _MEDIA_INFO_SUFFIX)
+            if not source_json.is_file():
+                return
             source_json.unlink()
             logger.info("【ffprobe媒体信息持久化】已清理已搬离源文件的 MediaInfo JSON：%s", source_json)
         except OSError as error:
-            logger.warning("【ffprobe媒体信息持久化】清理源 JSON 失败 path=%s error=%s", source_json, error)
+            logger.warning("【ffprobe媒体信息持久化】清理源 JSON 失败 source=%s error=%s", source_path, error)
 
     @staticmethod
     def _cache_key(source_path: str) -> str:
@@ -678,7 +534,7 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         finally:
             # 清理放在该条整理记录的处理末尾；不受生成 JSON 筛选条件影响。
             # 无论本次写入成功、已存在、被筛选或探测失败，都会执行一次安全检查。
-            self._cleanup_source_json(source_path, destination)
+            self._schedule_source_json_cleanup(source_path)
 
     def _persist(self, destination: Path, probe: Dict[str, Any]) -> None:
         if not destination.is_file():
