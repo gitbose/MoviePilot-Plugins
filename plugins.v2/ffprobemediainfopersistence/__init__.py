@@ -409,6 +409,15 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         # 枚举类字段的 value 通常才是配置中应填写的值。
         return str(getattr(value, "value", value) or "").strip()
 
+    @classmethod
+    def _transfer_succeeded(cls, data: Any) -> bool:
+        """仅在 MP 明确标记整理成功后，才写 JSON 或启动兜底 ffprobe。"""
+        transfer_info = cls._event_transfer_info(data)
+        success = cls._value(transfer_info, ("success",))
+        if success is None:
+            success = cls._value(data, ("success",))
+        return success is True
+
     def _matches_filters(self, destination: Optional[Path], transfer_method: str) -> bool:
         """依据配置执行“同时匹配”或“任一匹配”。"""
         matches: List[bool] = []
@@ -602,6 +611,9 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         if not self._enabled:
             return
         data = event.event_data or {}
+        if not type(self)._transfer_succeeded(data):
+            logger.debug("【ffprobe媒体信息持久化】整理未成功，跳过 JSON 写入和主动提取")
+            return
         destination = type(self)._destination_path(data)
         source_path = type(self)._source_path(data)
         if destination is None or source_path is None:
