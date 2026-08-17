@@ -394,7 +394,19 @@ class FFprobeMediaInfoPersistence(_PluginBase):
             ("target_path", "dest_path", "dest", "target", "destination"),
         )
         if value is None:
+            # MP V2 TransferComplete：最终单文件路径位于
+            # transferinfo.target_item.path，而非 target_path。
+            target_item = cls._value(
+                transfer_info, ("target_item", "target_fileitem", "target_file_item")
+            )
+            value = cls._value(target_item, ("path",))
+        if value is None:
             value = cls._value(data, ("target_path", "dest_path", "dest", "target"))
+        if value is None:
+            target_item = cls._value(
+                data, ("target_item", "target_fileitem", "target_file_item")
+            )
+            value = cls._value(target_item, ("path",))
         if not value:
             return None
         path = Path(str(value).strip())
