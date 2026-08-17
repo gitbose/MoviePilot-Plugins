@@ -331,7 +331,7 @@ class FFprobeMediaInfoPersistence(_PluginBase):
 
     @classmethod
     def _event_snapshot(cls, data: Any) -> str:
-        """仅在事件字段不兼容时输出数据结构，便于适配不同 MP 版本。"""
+        """仅在事件字段不兼容时输出关键结构，避免影片简介淹没路径字段。"""
         try:
             if hasattr(data, "model_dump"):
                 value = data.model_dump(exclude_none=True)
@@ -341,7 +341,30 @@ class FFprobeMediaInfoPersistence(_PluginBase):
                 value = data
             else:
                 value = vars(data)
-            return repr(value)[:4000]
+            if not isinstance(value, dict):
+                return repr(value)[:1000]
+            parts = [f"keys={list(value.keys())}"]
+            for name in (
+                "transferinfo", "transfer_info", "fileitem", "file_item",
+                "source_path", "src_path", "target_path", "dest_path",
+                "destination", "target", "dest",
+            ):
+                item = value.get(name)
+                if item is None:
+                    continue
+                if name in ("fileitem", "file_item"):
+                    parts.append(f"{name}.path={cls._value(item, ('path',))!r}")
+                elif name in ("transferinfo", "transfer_info"):
+                    if hasattr(item, "model_dump"):
+                        item = item.model_dump(exclude_none=True)
+                    elif hasattr(item, "dict"):
+                        item = item.dict(exclude_none=True)
+                    elif not isinstance(item, dict):
+                        item = vars(item)
+                    parts.append(f"{name}={item!r}"[:2000])
+                else:
+                    parts.append(f"{name}={item!r}"[:1000])
+            return "; ".join(parts)
         except Exception:
             return repr(data)[:1000]
 
@@ -358,6 +381,9 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         )
         if value is None:
             value = cls._value(data, ("source_path", "src_path", "src", "source"))
+        if value is None:
+            file_item = cls._value(data, ("fileitem", "file_item", "source_item"))
+            value = cls._value(file_item, ("path",))
         return str(value).strip() if value else None
 
     @classmethod
@@ -556,7 +582,11 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         if not type(self)._is_media_path(source_path):
             logger.info("【ffprobe媒体信息持久化】源文件不是受支持媒体类型，跳过：%s", source_path)
             return
-        logger.info("【ffprobe媒体信息持久化】收到重命名构建事件：%s", source_path)
+        logger.info(
+            "【ffprobe媒体信息持久化】收到重命名构建事件：%s；event_data=%s",
+            source_path,
+            type(self)._event_snapshot(data),
+        )
         destination = type(self)._destination_path(data)
         transfer_method = type(self)._transfer_method(data)
         # 如果此时已有目标路径，先筛选再读取缓存，避免无用处理。
