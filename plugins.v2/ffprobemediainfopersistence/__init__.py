@@ -43,7 +43,7 @@ class FFprobeMediaInfoPersistence(_PluginBase):
     plugin_name = "ffprobe媒体信息持久化"
     plugin_desc = "复用 ffprobe命名补充的媒体信息并持久化为 Emby MediaInfo JSON。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/refs/heads/main/icons/ffmpeg.png"
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.0"
     plugin_author = "gitbose"
     author_url = "https://github.com/gitbose"
     plugin_config_prefix = "ffprobemediainfopersistence_"
@@ -133,7 +133,7 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         return []
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
-        """紧凑双列布局；单选组避免部分 MP 版本的 VSelect 无法操作。"""
+        """使用 VSelect，避免部分 V2 前端无法保存 VRadioGroup 的选择。"""
         return [{"component": "VForm", "content": [
             {"component": "VRow", "content": [
                 {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
@@ -151,10 +151,10 @@ class FFprobeMediaInfoPersistence(_PluginBase):
                 {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
                     {"component": "VTextField", "props": {"model": "fallback_timeout", "label": "兜底提取超时（秒）", "type": "number", "min": 1, "max": 300}}]},
             ]},
-            {"component": "VRadioGroup", "props": {"model": "filter_match_mode", "label": "筛选条件关系", "inline": true}, "content": [
-                {"component": "VRadio", "props": {"label": "同时匹配", "value": "all"}},
-                {"component": "VRadio", "props": {"label": "任一匹配", "value": "any"}},
-            ]},
+            {"component": "VSelect", "props": {"model": "filter_match_mode", "label": "筛选条件关系", "items": [
+                {"title": "同时匹配", "value": "all"},
+                {"title": "任一匹配", "value": "any"},
+            ], "hint": "同时匹配：所有已填写条件都命中；任一匹配：任意一项命中。", "persistent-hint": True}},
             {"component": "VRow", "content": [
                 {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
                     {"component": "VTextarea", "props": {"model": "transfer_methods", "label": "限定整理方式（可选，一行一个）", "placeholder": "复制\n移动\n硬链接\n软链接", "rows": 3, "hint": "留空表示不限制整理方式。"}}]},
