@@ -318,6 +318,8 @@ class FFprobeMediaInfoPersistence(_PluginBase):
     @staticmethod
     def _value(value: Any, names: Tuple[str, ...]) -> Any:
         """兼容 MP 事件中 dict、Pydantic 模型和普通对象三种传参。"""
+        if value is None:
+            return None
         if isinstance(value, dict):
             for name in names:
                 if value.get(name) is not None:
@@ -328,6 +330,18 @@ class FFprobeMediaInfoPersistence(_PluginBase):
             if candidate is not None:
                 return candidate
         return None
+
+    @classmethod
+    def _file_path_value(cls, value: Any) -> Optional[str]:
+        """从路径字符串、FileItem 或序列化后的 FileItem 读取 path。"""
+        if isinstance(value, (str, Path)):
+            text = str(value).strip()
+            return text or None
+        path = cls._value(value, ("path",))
+        if path is None:
+            return None
+        text = str(path).strip()
+        return text or None
 
     @classmethod
     def _event_snapshot(cls, data: Any) -> str:
@@ -399,14 +413,19 @@ class FFprobeMediaInfoPersistence(_PluginBase):
             target_item = cls._value(
                 transfer_info, ("target_item", "target_fileitem", "target_file_item")
             )
-            value = cls._value(target_item, ("path",))
+            value = cls._file_path_value(target_item)
         if value is None:
             value = cls._value(data, ("target_path", "dest_path", "dest", "target"))
         if value is None:
             target_item = cls._value(
                 data, ("target_item", "target_fileitem", "target_file_item")
             )
-            value = cls._value(target_item, ("path",))
+            value = cls._file_path_value(target_item)
+        if value is None:
+            # 部分 MP 版本只保证 file_list_new；第一项为本次最终整理文件。
+            file_list_new = cls._value(transfer_info, ("file_list_new",))
+            if isinstance(file_list_new, (list, tuple)) and file_list_new:
+                value = cls._file_path_value(file_list_new[0])
         if not value:
             return None
         path = Path(str(value).strip())
