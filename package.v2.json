@@ -1,12 +1,14 @@
 {
   "FFprobeMediaInfoPersistence": {
     "name": "ffprobe媒体信息持久化",
-    "description": "优先复用 ffprobe命名补充缓存并后台写入 JSON；缓存缺失时最多 3 个后台任务进行 10 秒兜底探测。",
+    "description": "复用 ffprobe命名补充的媒体信息并持久化为 Emby MediaInfo JSON。",
     "labels": "ffprobe, Emby, 媒体信息",
     "version": "1.0.0",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/refs/heads/main/icons/ffmpeg.png",
+    "author": "gitbose",
+    "level": 1,
     "history": {
-      "v1.0.0": "首次发布：复用 ffprobe命名补充缓存，整理后写入 Emby MediaInfo JSON。"
+      "v1.0.0": "复用 ffprobe命名补充缓存，整理后写入 Emby MediaInfo JSON。"
     }
   }
 }
