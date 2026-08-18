@@ -9,13 +9,13 @@ from __future__ import annotations
 import json
 import re
 import sys
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from subprocess import TimeoutExpired, run
 from threading import Lock, Thread, Timer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Type
 
-from app.core.cache import TTLCache
 from app.core.config import settings
 from app.core.event import Event, eventmanager
 from app.log import logger
@@ -29,6 +29,9 @@ _DOVI_TAGS = frozenset({"dvh1", "dvhe", "dva1", "dvav"})
 _DEFAULT_FALLBACK_FFPROBE_TIMEOUT_SEC = 10
 _MAX_FALLBACK_FFPROBE_TIMEOUT_SEC = 300
 _SOURCE_JSON_CLEANUP_DELAY_SEC = 10
+_PENDING_PROBE_RETENTION_SEC = 43200
+# 正常记录会在完成事件中立即取走；仅对没有完成事件的异常记录定期回收即可。
+_PENDING_PROBE_PRUNE_INTERVAL_SEC = 300
 _TRANSFER_METHOD_ALIASES = {
     "复制": "copy", "copy": "copy",
     "移动": "move", "move": "move",
@@ -51,9 +54,6 @@ class FFprobeMediaInfoPersistence(_PluginBase):
     plugin_order = 51
     auth_level = 1
 
-    _pending_probe_cache = TTLCache(
-        region="ffprobe_media_info_persistence_pending", maxsize=2048, ttl=3600
-    )
     _FILTER_MATCH_ALL = "all"
     _FILTER_MATCH_ANY = "any"
     _FALLBACK_WORKERS = 3
@@ -76,6 +76,11 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         self._cleanup_timers_lock = Lock()
         self._writing_json_paths: set[str] = set()
         self._writing_json_paths_lock = Lock()
+        # 跨 TransferRenameBuild / TransferComplete 的临时交接表。
+        # 不设容量淘汰；成功事件一到即取出并删除，避免大批量任务误入主动提取。
+        self._pending_probes: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        self._pending_probes_lock = Lock()
+        self._pending_probe_last_prune = 0.0
 
     def init_plugin(self, config: dict = None) -> None:
         config = config or {}
@@ -110,7 +115,7 @@ class FFprobeMediaInfoPersistence(_PluginBase):
             else type(self)._FILTER_MATCH_ALL
         )
         if not self._enabled:
-            type(self)._clear_pending_cache()
+            self._clear_pending_probes()
             self._stop_background_tasks()
             logger.info("【ffprobe媒体信息持久化】插件未启用，不监听整理事件")
         elif workers_changed and self._fallback_executor is not None:
@@ -237,7 +242,7 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         pass
 
     def stop_service(self) -> None:
-        type(self)._clear_pending_cache()
+        self._clear_pending_probes()
         self._stop_background_tasks()
 
     def _stop_background_tasks(self) -> None:
@@ -294,12 +299,54 @@ class FFprobeMediaInfoPersistence(_PluginBase):
             return
         self._persist(destination, probe, "主动提取")
 
-    @classmethod
-    def _clear_pending_cache(cls) -> None:
-        try:
-            cls._pending_probe_cache.clear()
-        except Exception as error:
-            logger.debug("【ffprobe媒体信息持久化】清理缓存失败：%s", error)
+    def _clear_pending_probes(self) -> None:
+        with self._pending_probes_lock:
+            self._pending_probes.clear()
+            self._pending_probe_last_prune = 0.0
+
+    def _prune_pending_probes_locked(self, now: float) -> None:
+        """清理未收到完成事件的异常旧记录，防止长期运行时无界积累。"""
+        if now - self._pending_probe_last_prune < _PENDING_PROBE_PRUNE_INTERVAL_SEC:
+            return
+        expired_keys = [
+            key
+            for key, (created_at, _) in self._pending_probes.items()
+            if now - created_at > _PENDING_PROBE_RETENTION_SEC
+        ]
+        for key in expired_keys:
+            self._pending_probes.pop(key, None)
+        self._pending_probe_last_prune = now
+
+    def _stash_pending_probe(
+        self, source_path: str, probe: Dict[str, Any], transfer_method: str
+    ) -> None:
+        now = time.monotonic()
+        key = type(self)._cache_key(source_path)
+        with self._pending_probes_lock:
+            self._prune_pending_probes_locked(now)
+            self._pending_probes[key] = (
+                now,
+                {"probe": probe, "transfer_method": transfer_method},
+            )
+
+    def _take_pending_probe(self, source_path: str) -> Optional[Dict[str, Any]]:
+        key = type(self)._cache_key(source_path)
+        now = time.monotonic()
+        with self._pending_probes_lock:
+            self._prune_pending_probes_locked(now)
+            item = self._pending_probes.pop(key, None)
+        if item is None:
+            return None
+        # 若完成事件异常延迟超过保留时间，不再使用过期的媒体信息。
+        if now - item[0] > _PENDING_PROBE_RETENTION_SEC:
+            return None
+        return item[1]
+
+    def _discard_pending_probe(self, source_path: str) -> None:
+        """该条已成功整理但不符合筛选条件，不必保留其命名阶段暂存。"""
+        key = type(self)._cache_key(source_path)
+        with self._pending_probes_lock:
+            self._pending_probes.pop(key, None)
 
     @staticmethod
     def _lines(value: Any) -> List[str]:
@@ -493,8 +540,10 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         return str(Path(source_path)).casefold()
 
     @classmethod
-    def _naming_plugin_class(cls) -> Optional[Type[Any]]:
-        """查找运行时已加载的 ffprobe命名补充类，不导入或修改其源码。"""
+    def _naming_plugin_classes(cls) -> List[Type[Any]]:
+        """查找所有运行时已加载的 ffprobe命名补充类。"""
+        candidates: List[Type[Any]] = []
+        seen: set[int] = set()
         for module in tuple(sys.modules.values()):
             candidate = getattr(module, "FFprobeNamingSupplement", None)
             if (
@@ -502,26 +551,30 @@ class FFprobeMediaInfoPersistence(_PluginBase):
                 and getattr(candidate, "plugin_config_prefix", None)
                 == "ffprobenamingsupplement_"
                 and hasattr(candidate, "_probe_cache")
+                and id(candidate) not in seen
             ):
-                return candidate
-        return None
+                candidates.append(candidate)
+                seen.add(id(candidate))
+        return candidates
 
     @classmethod
     def _get_cached_probe(cls, source_path: str) -> Optional[Dict[str, Any]]:
         """从上游插件的私有缓存取结果；兜底探测由调用方明确决定。"""
-        plugin_class = cls._naming_plugin_class()
-        if plugin_class is None:
+        plugin_classes = cls._naming_plugin_classes()
+        if not plugin_classes:
             logger.debug("【ffprobe媒体信息持久化】未加载 ffprobe命名补充，跳过")
             return None
-        try:
-            probe_target = plugin_class._resolve_probe_target(source_path)
-            if not probe_target:
-                return None
-            result = plugin_class._probe_cache.get(probe_target)
-            return result if isinstance(result, dict) else None
-        except Exception as error:
-            logger.debug("【ffprobe媒体信息持久化】读取上游 ffprobe 缓存失败：%s", error)
-            return None
+        for plugin_class in plugin_classes:
+            try:
+                probe_target = plugin_class._resolve_probe_target(source_path)
+                if not probe_target:
+                    continue
+                result = plugin_class._probe_cache.get(probe_target)
+                if isinstance(result, dict):
+                    return result
+            except Exception as error:
+                logger.debug("【ffprobe媒体信息持久化】读取上游 ffprobe 缓存失败：%s", error)
+        return None
 
     @classmethod
     def _run_fallback_ffprobe(
@@ -529,10 +582,10 @@ class FFprobeMediaInfoPersistence(_PluginBase):
     ) -> Optional[Dict[str, Any]]:
         """缓存缺失时的唯一兜底：按配置超时执行一次 ffprobe。"""
         probe_target = media_path
-        naming_plugin = cls._naming_plugin_class()
-        if naming_plugin is not None:
+        naming_plugins = cls._naming_plugin_classes()
+        if naming_plugins:
             try:
-                probe_target = naming_plugin._resolve_probe_target(media_path)
+                probe_target = naming_plugins[-1]._resolve_probe_target(media_path)
             except Exception:
                 probe_target = media_path
         if not probe_target:
@@ -597,13 +650,7 @@ class FFprobeMediaInfoPersistence(_PluginBase):
                 source_path,
             )
             return
-        type(self)._pending_probe_cache.set(
-            type(self)._cache_key(source_path),
-            {
-                "probe": probe,
-                "transfer_method": transfer_method,
-            },
-        )
+        self._stash_pending_probe(source_path, probe, transfer_method)
 
     @eventmanager.register(EventType.TransferComplete)
     def on_transfer_complete(self, event: Event) -> None:
@@ -612,6 +659,10 @@ class FFprobeMediaInfoPersistence(_PluginBase):
             return
         data = event.event_data or {}
         if not type(self)._transfer_succeeded(data):
+            # 命名阶段可能已暂存结果；失败记录不会有 JSON，立即释放即可。
+            failed_source_path = type(self)._source_path(data)
+            if failed_source_path:
+                self._discard_pending_probe(failed_source_path)
             logger.debug("【ffprobe媒体信息持久化】整理未成功，跳过 JSON 写入和主动提取")
             return
         destination = type(self)._destination_path(data)
@@ -627,9 +678,10 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         transfer_method = type(self)._transfer_method(data)
         try:
             if not self._matches_filters(destination, transfer_method):
+                self._discard_pending_probe(source_path)
                 logger.debug("【ffprobe媒体信息持久化】目标不符合生成 JSON 筛选条件，跳过：%s", destination)
                 return
-            pending = type(self)._pending_probe_cache.get(type(self)._cache_key(source_path))
+            pending = self._take_pending_probe(source_path)
             probe = pending.get("probe") if isinstance(pending, dict) else None
             if not isinstance(probe, dict):
                 # 若本插件在前一个链式事件中稍早执行，完成事件时再读一次上游缓存。
