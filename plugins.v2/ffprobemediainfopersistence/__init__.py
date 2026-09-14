@@ -10,10 +10,11 @@ import json
 import re
 import sys
 import time
+from heapq import heappop, heappush
 from hashlib import sha1
 from concurrent.futures import Future, ThreadPoolExecutor
 from subprocess import TimeoutExpired, run
-from threading import Lock, Timer
+from threading import Condition, Lock, Thread
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Type
 
@@ -39,6 +40,9 @@ _FAILED_EXTRACTIONS_DATA_KEY = "failed_extractions"
 _FAILED_EXTRACTIONS_VIEW_KEY = "failed_extractions_view"
 _MAX_FAILED_EXTRACTION_RECORDS = 2000
 _CACHE_WRITE_WORKERS = 32
+_RECORD_CATEGORY_FAILURE = "failure"
+_RECORD_CATEGORY_ABNORMAL_SIZE = "abnormal_size"
+_RECORD_CATEGORY_ABNORMAL_SIZE_PENDING = "abnormal_size_pending"
 _TRANSFER_METHOD_ALIASES = {
     "复制": "copy", "copy": "copy",
     "移动": "move", "move": "move",
@@ -69,6 +73,7 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         super().__init__()
         self._enabled = False
         self._overwrite_json = False
+        self._allow_abnormal_size_json = True
         self._fallback_probe = True
         self._fallback_workers = type(self)._FALLBACK_WORKERS
         self._fallback_timeout = _DEFAULT_FALLBACK_FFPROBE_TIMEOUT_SEC
@@ -83,8 +88,13 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         self._cached_write_executor: Optional[ThreadPoolExecutor] = None
         self._cached_write_tasks: set[Future] = set()
         self._cached_write_tasks_lock = Lock()
-        self._cleanup_timers: set[Timer] = set()
-        self._cleanup_timers_lock = Lock()
+        # 单一延迟调度线程代替“每个文件一个 Timer”，大批量整理时不会积累大量休眠线程。
+        self._cleanup_condition = Condition()
+        self._cleanup_queue: List[Tuple[float, int, str]] = []
+        self._cleanup_sequence = 0
+        self._cleanup_generation = 0
+        self._cleanup_worker: Optional[Thread] = None
+        self._cleanup_worker_generation = -1
         self._writing_json_paths: set[str] = set()
         self._writing_json_paths_lock = Lock()
         # 跨 TransferRenameBuild / TransferComplete 的临时交接表。
@@ -108,6 +118,7 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         config = config or {}
         self._enabled = bool(config.get("enabled"))
         self._overwrite_json = bool(config.get("overwrite_json"))
+        self._allow_abnormal_size_json = bool(config.get("allow_abnormal_size_json", True))
         self._fallback_probe = bool(config.get("fallback_probe", True))
         try:
             fallback_workers = int(config.get("fallback_workers", type(self)._FALLBACK_WORKERS))
@@ -226,16 +237,22 @@ class FFprobeMediaInfoPersistence(_PluginBase):
                     }}]},
             ]},
             {"component": "VRow", "content": [
-                {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
                     {"component": "VSwitch", "props": {
                         "model": "fallback_probe", "label": "上游缓存缺失时主动提取",
                         "hint": "仅缓存未命中时，对整理后的目标文件执行 ffprobe；任务在后台运行。",
                         "persistent-hint": True,
                     }}]},
-                {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
                     {"component": "VSwitch", "props": {
                         "model": "overwrite_json", "label": "覆盖同名 JSON",
                         "hint": "目标目录已有同名 JSON 时",
+                        "persistent-hint": True,
+                    }}]},
+                {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                    {"component": "VSwitch", "props": {
+                        "model": "allow_abnormal_size_json", "label": "生成异常大小 JSON",
+                        "hint": "当 .json 文件读取到的 Size < 1M 时",
                         "persistent-hint": True,
                     }}]},
             ]},
@@ -288,6 +305,7 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         ]}], {
             "enabled": False,
             "overwrite_json": False,
+            "allow_abnormal_size_json": True,
             "fallback_probe": True,
             "fallback_workers": 3,
             "fallback_timeout": _DEFAULT_FALLBACK_FFPROBE_TIMEOUT_SEC,
@@ -303,17 +321,41 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         view = self._failed_extractions_view()
         state = view["state"]
         reason = view["reason"]
-        state_records = [
-            record for record in records
-            if bool(record.get("handled")) == (state == "handled")
-        ]
+        if state in {
+            _RECORD_CATEGORY_ABNORMAL_SIZE,
+            _RECORD_CATEGORY_ABNORMAL_SIZE_PENDING,
+        }:
+            state_records = [
+                record for record in records
+                if record.get("category") == state
+            ]
+        else:
+            state_records = [
+                record for record in records
+                if record.get("category") == _RECORD_CATEGORY_FAILURE
+                and bool(record.get("handled")) == (state == "handled")
+            ]
         visible_records = [
             record for record in state_records
             if not reason or record.get("reason") == reason
         ]
         selected_count = sum(1 for record in records if record.get("selected"))
-        pending_count = sum(1 for record in records if not record.get("handled"))
-        handled_count = len(records) - pending_count
+        pending_count = sum(
+            1 for record in records
+            if record.get("category") == _RECORD_CATEGORY_FAILURE and not record.get("handled")
+        )
+        handled_count = sum(
+            1 for record in records
+            if record.get("category") == _RECORD_CATEGORY_FAILURE and record.get("handled")
+        )
+        abnormal_size_count = sum(
+            1 for record in records
+            if record.get("category") == _RECORD_CATEGORY_ABNORMAL_SIZE
+        )
+        abnormal_size_pending_count = sum(
+            1 for record in records
+            if record.get("category") == _RECORD_CATEGORY_ABNORMAL_SIZE_PENDING
+        )
         apikey = settings.API_TOKEN
         progress = self._manual_retry_progress_text()
         retry_running = bool(self._manual_retry_progress_snapshot().get("running"))
@@ -328,6 +370,12 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         for key, label, count in (
             ("pending", "未处理", pending_count),
             ("handled", "已处理", handled_count),
+            (_RECORD_CATEGORY_ABNORMAL_SIZE, "异常大小已生成", abnormal_size_count),
+            (
+                _RECORD_CATEGORY_ABNORMAL_SIZE_PENDING,
+                "异常大小未生成",
+                abnormal_size_pending_count,
+            ),
         ):
             status_buttons.append({
                 "component": "VBtn",
@@ -394,8 +442,22 @@ class FFprobeMediaInfoPersistence(_PluginBase):
                             ),
                         }],
                     },
-                    {"component": "td", "text": str(record.get("first_failed_at") or "-")},
-                    {"component": "td", "text": str(record.get("reason") or "未知错误")},
+                    {
+                        "component": "td",
+                        "text": str(record.get("first_failed_at") or "-"),
+                    },
+                    {
+                        "component": "td",
+                        "text": (
+                            f"原始 Size: {record.get('raw_size')}（已按 0 写入 JSON）"
+                            if record.get("category") == _RECORD_CATEGORY_ABNORMAL_SIZE
+                            else (
+                                f"原始 Size: {record.get('raw_size')}（未生成 JSON）"
+                                if record.get("category") == _RECORD_CATEGORY_ABNORMAL_SIZE_PENDING
+                                else str(record.get("reason") or "未知错误")
+                            )
+                        ),
+                    },
                     {"component": "td", "text": str(record.get("attempt_count") or 0)},
                     {
                         "component": "td",
@@ -471,8 +533,8 @@ class FFprobeMediaInfoPersistence(_PluginBase):
                 "content": [
                     {"component": "thead", "content": [{"component": "tr", "content": [
                         {"component": "th", "text": "选择"},
-                        {"component": "th", "text": "首次失败时间"},
-                        {"component": "th", "text": "失败原因"},
+                        {"component": "th", "text": "首次记录时间"},
+                        {"component": "th", "text": "失败原因 / 大小信息"},
                         {"component": "th", "text": "尝试次数"},
                         {"component": "th", "text": "目标文件"},
                     ]}]},
@@ -485,7 +547,7 @@ class FFprobeMediaInfoPersistence(_PluginBase):
                 "type": "warning",
                 "variant": "tonal",
                 "density": "compact",
-                "text": "删除记录仅移除本插件的失败提取记录，不删除媒体文件、MediaInfo JSON 或 MoviePilot 整理历史",
+                "text": "删除记录仅移除本插件的失败提取记录，不删除媒体文件、MediaInfo JSON 或 MoviePilot 整理历史；异常大小栏是已进行生成json文件",
             },
         })
         return [{"component": "div", "props": {"class": "d-flex flex-column ga-3"}, "content": content}]
@@ -493,6 +555,12 @@ class FFprobeMediaInfoPersistence(_PluginBase):
     @staticmethod
     def _failure_record_id(destination: str) -> str:
         return sha1(str(Path(destination)).casefold().encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _abnormal_size_record_id(destination: str) -> str:
+        return "abnormal_size:" + sha1(
+            str(Path(destination)).casefold().encode("utf-8")
+        ).hexdigest()
 
     def _failed_extractions(self) -> List[Dict[str, Any]]:
         """读取并规范化失败提取记录，兼容旧数据或局部损坏数据。"""
@@ -512,6 +580,15 @@ class FFprobeMediaInfoPersistence(_PluginBase):
                 "attempt_count": max(0, type(self)._integer(raw.get("attempt_count"), 0) or 0),
                 "handled": bool(raw.get("handled")),
                 "selected": bool(raw.get("selected")),
+                "category": (
+                    raw.get("category")
+                    if raw.get("category") in {
+                        _RECORD_CATEGORY_ABNORMAL_SIZE,
+                        _RECORD_CATEGORY_ABNORMAL_SIZE_PENDING,
+                    }
+                    else _RECORD_CATEGORY_FAILURE
+                ),
+                "raw_size": type(self)._integer(raw.get("raw_size"), 0) or 0,
             })
         return records
 
@@ -522,7 +599,16 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         raw_view = self.get_data(_FAILED_EXTRACTIONS_VIEW_KEY) or {}
         state = str(raw_view.get("state") if isinstance(raw_view, dict) else "pending")
         return {
-            "state": state if state in {"pending", "handled"} else "pending",
+            "state": (
+                state
+                if state in {
+                    "pending",
+                    "handled",
+                    _RECORD_CATEGORY_ABNORMAL_SIZE,
+                    _RECORD_CATEGORY_ABNORMAL_SIZE_PENDING,
+                }
+                else "pending"
+            ),
             "reason": str(raw_view.get("reason") or "") if isinstance(raw_view, dict) else "",
         }
 
@@ -559,7 +645,15 @@ class FFprobeMediaInfoPersistence(_PluginBase):
     ) -> Any:
         if not self._api_authorized(apikey):
             return self._api_denied()
-        normalized_state = state if state in {"pending", "handled"} else "pending"
+        normalized_state = (
+            state if state in {
+                "pending",
+                "handled",
+                _RECORD_CATEGORY_ABNORMAL_SIZE,
+                _RECORD_CATEGORY_ABNORMAL_SIZE_PENDING,
+            }
+            else "pending"
+        )
         with self._failed_extractions_lock:
             records = self._failed_extractions()
             for record in records:
@@ -672,13 +766,23 @@ class FFprobeMediaInfoPersistence(_PluginBase):
                     str(destination), self._fallback_timeout
                 )
                 if isinstance(probe, dict):
-                    success = self._persist(destination, probe, "手动重新提取")
+                    # 手动重新提取的目的是修复已记录项目，即使关闭全局覆盖也要写入新结果。
+                    success = self._persist(
+                        destination, probe, "手动重新提取", force_overwrite=True
+                    )
                     if not success:
                         failure_reason = "JSON 写入失败"
         except Exception as error:
             failure_reason = "主动提取执行错误"
             logger.warning("【ffprobe媒体信息持久化】手动重新提取异常 path=%s error=%s", destination, error)
-        if success:
+        if record.get("category") in {
+            _RECORD_CATEGORY_ABNORMAL_SIZE,
+            _RECORD_CATEGORY_ABNORMAL_SIZE_PENDING,
+        }:
+            # _persist 会按此次 ffprobe 的原始 Size 自动保留或移除异常大小记录。
+            if not success:
+                self._mark_abnormal_size_retry_failed(record_id)
+        elif success:
             self._remove_failed_extraction(record_id)
         else:
             self._mark_manual_retry_failed(record_id, failure_reason)
@@ -696,7 +800,10 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         with self._failed_extractions_lock:
             records = self._failed_extractions()
             for record in records:
-                if record["id"] == record_id:
+                if (
+                    record["id"] == record_id
+                    and record.get("category") == _RECORD_CATEGORY_FAILURE
+                ):
                     record["reason"] = reason
                     self._save_failed_extractions(records)
                     return
@@ -708,6 +815,8 @@ class FFprobeMediaInfoPersistence(_PluginBase):
                 "attempt_count": 0,
                 "handled": False,
                 "selected": False,
+                "category": _RECORD_CATEGORY_FAILURE,
+                "raw_size": 0,
             })
             self._save_failed_extractions(records)
 
@@ -715,7 +824,10 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         with self._failed_extractions_lock:
             records = self._failed_extractions()
             for record in records:
-                if record["id"] == record_id:
+                if (
+                    record["id"] == record_id
+                    and record.get("category") == _RECORD_CATEGORY_FAILURE
+                ):
                     record["handled"] = True
                     record["selected"] = False
                     record["reason"] = reason
@@ -727,10 +839,82 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         with self._failed_extractions_lock:
             records = self._failed_extractions()
             self._save_failed_extractions([
-                record for record in records if record["id"] != record_id
+                record for record in records
+                if not (
+                    record["id"] == record_id
+                    and record.get("category") == _RECORD_CATEGORY_FAILURE
+                )
             ])
 
+    def _record_abnormal_size(
+        self, destination: Path, raw_size: int, generated: bool
+    ) -> None:
+        """记录远程 Size 不可信的小值；生成与未生成分别显示，不影响失败提取分类。"""
+        record_id = type(self)._abnormal_size_record_id(str(destination))
+        category = (
+            _RECORD_CATEGORY_ABNORMAL_SIZE
+            if generated
+            else _RECORD_CATEGORY_ABNORMAL_SIZE_PENDING
+        )
+        with self._failed_extractions_lock:
+            records = self._failed_extractions()
+            for record in records:
+                if record["id"] == record_id:
+                    record["raw_size"] = raw_size
+                    record["selected"] = False
+                    record["category"] = category
+                    self._save_failed_extractions(records)
+                    return
+            records.append({
+                "id": record_id,
+                "destination": str(destination),
+                "first_failed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "reason": "异常大小",
+                "attempt_count": 0,
+                "handled": False,
+                "selected": False,
+                "category": category,
+                "raw_size": raw_size,
+            })
+            self._save_failed_extractions(records)
+
+    def _remove_abnormal_size(self, destination: Path) -> None:
+        record_id = type(self)._abnormal_size_record_id(str(destination))
+        with self._failed_extractions_lock:
+            records = self._failed_extractions()
+            remaining = [
+                record for record in records
+                if not (
+                    record["id"] == record_id
+                    and record.get("category") in {
+                        _RECORD_CATEGORY_ABNORMAL_SIZE,
+                        _RECORD_CATEGORY_ABNORMAL_SIZE_PENDING,
+                    }
+                )
+            ]
+            # 正常媒体通常没有异常记录；未移除任何项时不做无意义的数据持久化。
+            if len(remaining) != len(records):
+                self._save_failed_extractions(remaining)
+
+    def _mark_abnormal_size_retry_failed(self, record_id: str) -> None:
+        """重试未完成时保留异常大小记录，但不将它混入“已处理”失败列表。"""
+        with self._failed_extractions_lock:
+            records = self._failed_extractions()
+            for record in records:
+                if (
+                    record["id"] == record_id
+                    and record.get("category") in {
+                        _RECORD_CATEGORY_ABNORMAL_SIZE,
+                        _RECORD_CATEGORY_ABNORMAL_SIZE_PENDING,
+                    }
+                ):
+                    record["selected"] = False
+                    record["attempt_count"] = int(record.get("attempt_count") or 0) + 1
+                    break
+            self._save_failed_extractions(records)
+
     def stop_service(self) -> None:
+        self._enabled = False
         self._clear_pending_probes()
         self._stop_background_tasks()
 
@@ -748,10 +932,10 @@ class FFprobeMediaInfoPersistence(_PluginBase):
             self._fallback_tasks.clear()
         with self._cached_write_tasks_lock:
             self._cached_write_tasks.clear()
-        with self._cleanup_timers_lock:
-            for timer in self._cleanup_timers:
-                timer.cancel()
-            self._cleanup_timers.clear()
+        with self._cleanup_condition:
+            self._cleanup_generation += 1
+            self._cleanup_queue.clear()
+            self._cleanup_condition.notify_all()
 
     def _submit_cached_persist(self, destination: Path, probe: Dict[str, Any]) -> None:
         """命中缓存后立即提交独立写入池，不占用主动 ffprobe 并发。"""
@@ -759,7 +943,12 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         if executor is None:
             logger.warning("【ffprobe媒体信息持久化】JSON 写入器未启动，跳过：%s", destination)
             return
-        future = executor.submit(self._persist, destination, probe, "复用上游缓存")
+        try:
+            future = executor.submit(self._persist, destination, probe, "复用上游缓存")
+        except RuntimeError:
+            # 插件停用或重载时执行器可能刚好关闭；不让事件回调因此报错。
+            logger.debug("【ffprobe媒体信息持久化】JSON 写入器已停止，跳过：%s", destination)
+            return
         with self._cached_write_tasks_lock:
             self._cached_write_tasks.add(future)
         future.add_done_callback(self._on_cached_write_done)
@@ -778,7 +967,11 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         if executor is None:
             logger.warning("【ffprobe媒体信息持久化】后台提取器未启动，跳过：%s", destination)
             return
-        future = executor.submit(self._background_probe_and_persist, destination)
+        try:
+            future = executor.submit(self._background_probe_and_persist, destination)
+        except RuntimeError:
+            logger.debug("【ffprobe媒体信息持久化】后台提取器已停止，跳过：%s", destination)
+            return
         with self._fallback_tasks_lock:
             self._fallback_tasks.add(future)
         future.add_done_callback(self._on_background_task_done)
@@ -1009,28 +1202,59 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         return Path(path).suffix.lower() in settings.RMT_MEDIAEXT
 
     def _schedule_source_json_cleanup(self, source_path: str) -> None:
-        """给媒体文件刷新留出 10 秒窗口，再判断是否需要清理孤立 JSON。"""
+        """给媒体文件刷新留出 10 秒窗口，再由单一调度线程判断是否清理孤立 JSON。"""
         if not self._cleanup_moved_source_json:
             return
-        timer: Timer
+        with self._cleanup_condition:
+            generation = self._cleanup_generation
+            if (
+                self._cleanup_worker is None
+                or not self._cleanup_worker.is_alive()
+                or self._cleanup_worker_generation != generation
+            ):
+                self._cleanup_worker_generation = generation
+                self._cleanup_worker = Thread(
+                    target=self._cleanup_worker_loop,
+                    args=(generation,),
+                    name="ffprobe-media-info-cleanup",
+                    daemon=True,
+                )
+                self._cleanup_worker.start()
+            self._cleanup_sequence += 1
+            heappush(
+                self._cleanup_queue,
+                (
+                    time.monotonic() + _SOURCE_JSON_CLEANUP_DELAY_SEC,
+                    self._cleanup_sequence,
+                    source_path,
+                ),
+            )
+            self._cleanup_condition.notify()
 
-        def cleanup_task() -> None:
-            try:
-                self._cleanup_source_json(source_path)
-            finally:
-                with self._cleanup_timers_lock:
-                    self._cleanup_timers.discard(timer)
-
-        timer = Timer(_SOURCE_JSON_CLEANUP_DELAY_SEC, cleanup_task)
-        timer.daemon = True
-        with self._cleanup_timers_lock:
-            self._cleanup_timers.add(timer)
-        timer.start()
+    def _cleanup_worker_loop(self, generation: int) -> None:
+        """按到期时间依次执行清理；停用/重载后立即退出旧调度线程。"""
+        while True:
+            with self._cleanup_condition:
+                while generation == self._cleanup_generation:
+                    if not self._cleanup_queue:
+                        self._cleanup_condition.wait()
+                        continue
+                    due_at, _, source_path = self._cleanup_queue[0]
+                    wait_seconds = due_at - time.monotonic()
+                    if wait_seconds > 0:
+                        self._cleanup_condition.wait(wait_seconds)
+                        continue
+                    heappop(self._cleanup_queue)
+                    break
+                else:
+                    return
+            # 不在条件锁中执行文件 I/O，避免阻塞后续延迟任务的入队。
+            self._cleanup_source_json(source_path)
 
     def _cleanup_source_json(self, source_path: str) -> None:
         """源文件在延迟检查时不存在，就删除严格同名的持久化 JSON。"""
         try:
-            if not self._cleanup_moved_source_json:
+            if not self._enabled or not self._cleanup_moved_source_json:
                 return
             source = Path(source_path)
             if source.exists():
@@ -1216,10 +1440,26 @@ class FFprobeMediaInfoPersistence(_PluginBase):
             # 清理放在该条整理记录的处理末尾；不受生成 JSON 筛选条件影响。
             self._schedule_source_json_cleanup(source_path)
 
-    def _persist(self, destination: Path, probe: Dict[str, Any], source: str) -> bool:
+    def _persist(
+        self,
+        destination: Path,
+        probe: Dict[str, Any],
+        source: str,
+        force_overwrite: bool = False,
+    ) -> bool:
         if not destination.is_file():
             logger.warning("【ffprobe媒体信息持久化】整理目标不存在，跳过：%s", destination)
             return False
+        raw_size = type(self)._raw_abnormal_size(probe)
+        if raw_size is not None and not self._allow_abnormal_size_json:
+            # 这是受配置控制的正常拦截，不应再记录为“JSON 写入失败”。
+            self._record_abnormal_size(destination, raw_size, generated=False)
+            logger.info(
+                "【ffprobe媒体信息持久化】检测到异常 Size=%s，按配置不生成 JSON：%s",
+                raw_size,
+                destination,
+            )
+            return True
         json_path = destination.with_name(destination.stem + _MEDIA_INFO_SUFFIX)
         path_key = str(json_path).casefold()
         with self._writing_json_paths_lock:
@@ -1229,7 +1469,7 @@ class FFprobeMediaInfoPersistence(_PluginBase):
                 return True
             self._writing_json_paths.add(path_key)
         try:
-            if json_path.exists() and not self._overwrite_json:
+            if json_path.exists() and not (self._overwrite_json or force_overwrite):
                 logger.info("【ffprobe媒体信息持久化】JSON 已存在，按配置不覆盖：%s", json_path)
                 return True
             document = type(self)._to_emby_document(probe)
@@ -1239,6 +1479,10 @@ class FFprobeMediaInfoPersistence(_PluginBase):
                 encoding="utf-8",
             )
             temporary.replace(json_path)
+            if raw_size is None:
+                self._remove_abnormal_size(destination)
+            else:
+                self._record_abnormal_size(destination, raw_size, generated=True)
             logger.info("【ffprobe媒体信息持久化】已保存 MediaInfo JSON（%s）：%s", source, json_path)
             return True
         except OSError as error:
@@ -1301,6 +1545,17 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         """远程 STRM 的 format.size 常为接口响应长度，过小时按未知大小输出。"""
         size = cls._integer(value, 0) or 0
         return size if size >= _MIN_RELIABLE_MEDIA_SIZE_BYTES else 0
+
+    @classmethod
+    def _raw_abnormal_size(cls, probe: Dict[str, Any]) -> Optional[int]:
+        """仅记录明确返回的非零小 Size；缺失或零表示未知，不作为异常记录。"""
+        format_info = probe.get("format") if isinstance(probe, dict) else None
+        if not isinstance(format_info, dict):
+            return None
+        size = cls._integer(format_info.get("size"), None)
+        if size is not None and 0 < size < _MIN_RELIABLE_MEDIA_SIZE_BYTES:
+            return size
+        return None
 
     @classmethod
     def _video_range(cls, stream: Dict[str, Any]) -> str:
