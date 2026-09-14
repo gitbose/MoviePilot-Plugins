@@ -240,6 +240,10 @@ class FFprobeMediaInfoPersistence(_PluginBase):
                         "persistent-hint": True,
                     }}]},
             ]},
+            {
+                "component": "div",
+                "props": {"style": "margin-top: -10px;"},
+                "content": [
             {"component": "VRow", "content": [
                 {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
                     {"component": "VSwitch", "props": {
@@ -256,7 +260,7 @@ class FFprobeMediaInfoPersistence(_PluginBase):
                 {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
                     {"component": "VSwitch", "props": {
                         "model": "allow_abnormal_size_json", "label": "生成异常大小 JSON",
-                        "hint": "当 .json 文件读取到的 Size < 1M 时",
+                        "hint": "当ffprobe读取到的 Size < 1M 时，Size值写为0",
                         "persistent-hint": True,
                     }}]},
             ]},
@@ -306,6 +310,8 @@ class FFprobeMediaInfoPersistence(_PluginBase):
             ]},
             {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "density": "compact", "text": "使用说明：优先复用“ffprobe命名补充”已获取的缓存，缓存命中后立即后台写入 JSON，最多 32 个并发。仅缓存缺失时才按“主动提取”配置对最终目标文件运行 ffprobe。上游 ffprobe 未请求章节，因此输出 JSON 的 Chapters 为空。"}},
             {"component": "VAlert", "props": {"type": "warning", "variant": "tonal", "density": "compact", "text": "JSON清理：文件整理完成后延迟 10 秒检查，若媒体文件已不存在，则清理媒体文件目录下严格同名的 -mediainfo.json 文件。"}},
+                ],
+            },
         ]}], {
             "enabled": False,
             "overwrite_json": False,
