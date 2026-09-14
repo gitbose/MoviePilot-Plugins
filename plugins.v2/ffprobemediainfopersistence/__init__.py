@@ -222,7 +222,7 @@ class FFprobeMediaInfoPersistence(_PluginBase):
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         """按整理流程排序的五行紧凑配置页。"""
         return [{"component": "VForm", "content": [
-            {"component": "VRow", "content": [
+            {"component": "VRow", "props": {"class": "mb-4"}, "content": [
                 {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
                     {"component": "VSwitch", "props": {
                         "model": "enabled", "label": "启用插件",
@@ -236,7 +236,7 @@ class FFprobeMediaInfoPersistence(_PluginBase):
                         "persistent-hint": True,
                     }}]},
             ]},
-            {"component": "VRow", "content": [
+            {"component": "VRow", "props": {"class": "mb-4"}, "content": [
                 {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
                     {"component": "VSwitch", "props": {
                         "model": "fallback_probe", "label": "上游缓存缺失时主动提取",
@@ -256,7 +256,7 @@ class FFprobeMediaInfoPersistence(_PluginBase):
                         "persistent-hint": True,
                     }}]},
             ]},
-            {"component": "VRow", "content": [
+            {"component": "VRow", "props": {"class": "mb-4"}, "content": [
                 {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
                     {"component": "VTextField", "props": {
                         "model": "fallback_workers", "label": "主动提取并发数",
@@ -282,7 +282,7 @@ class FFprobeMediaInfoPersistence(_PluginBase):
                         "persistent-hint": True,
                     }}]},
             ]},
-            {"component": "VRow", "content": [
+            {"component": "VRow", "props": {"class": "mb-4"}, "content": [
                 {"component": "VCol", "props": {"cols": 12}, "content": [
                     {"component": "VTextarea", "props": {
                         "model": "transfer_methods", "label": "限定整理方式（可选，一行一个）",
@@ -291,7 +291,7 @@ class FFprobeMediaInfoPersistence(_PluginBase):
                         "persistent-hint": True,
                     }}]},
             ]},
-            {"component": "VRow", "content": [
+            {"component": "VRow", "props": {"class": "mb-4"}, "content": [
                 {"component": "VCol", "props": {"cols": 12}, "content": [
                     {"component": "VTextarea", "props": {
                         "model": "destination_roots", "label": "限定整理目标路径（可选，一行一个）",
