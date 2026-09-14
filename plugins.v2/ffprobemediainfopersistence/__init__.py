@@ -10,9 +10,10 @@ import json
 import re
 import sys
 import time
+from hashlib import sha1
 from concurrent.futures import Future, ThreadPoolExecutor
 from subprocess import TimeoutExpired, run
-from threading import Lock, Thread, Timer
+from threading import Lock, Timer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Type
 
@@ -20,11 +21,13 @@ from app.core.config import settings
 from app.core.event import Event, eventmanager
 from app.log import logger
 from app.plugins import _PluginBase
+from app import schemas
 from app.schemas import FileItem, TransferRenameBuildEventData
 from app.schemas.types import ChainEventType, EventType
 
 
 _MEDIA_INFO_SUFFIX = "-mediainfo.json"
+_MIN_RELIABLE_MEDIA_SIZE_BYTES = 1024 * 1024
 _DOVI_TAGS = frozenset({"dvh1", "dvhe", "dva1", "dvav"})
 _DEFAULT_FALLBACK_FFPROBE_TIMEOUT_SEC = 10
 _MAX_FALLBACK_FFPROBE_TIMEOUT_SEC = 300
@@ -32,6 +35,10 @@ _SOURCE_JSON_CLEANUP_DELAY_SEC = 10
 _PENDING_PROBE_RETENTION_SEC = 43200
 # 正常记录会在完成事件中立即取走；仅对没有完成事件的异常记录定期回收即可。
 _PENDING_PROBE_PRUNE_INTERVAL_SEC = 300
+_FAILED_EXTRACTIONS_DATA_KEY = "failed_extractions"
+_FAILED_EXTRACTIONS_VIEW_KEY = "failed_extractions_view"
+_MAX_FAILED_EXTRACTION_RECORDS = 2000
+_CACHE_WRITE_WORKERS = 32
 _TRANSFER_METHOD_ALIASES = {
     "复制": "copy", "copy": "copy",
     "移动": "move", "move": "move",
@@ -72,6 +79,10 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         self._fallback_executor: Optional[ThreadPoolExecutor] = None
         self._fallback_tasks: set[Future] = set()
         self._fallback_tasks_lock = Lock()
+        # 上游缓存命中后的 JSON 写入与主动 ffprobe 分开限流，避免大批量整理创建海量线程。
+        self._cached_write_executor: Optional[ThreadPoolExecutor] = None
+        self._cached_write_tasks: set[Future] = set()
+        self._cached_write_tasks_lock = Lock()
         self._cleanup_timers: set[Timer] = set()
         self._cleanup_timers_lock = Lock()
         self._writing_json_paths: set[str] = set()
@@ -81,6 +92,17 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         self._pending_probes: Dict[str, Tuple[float, Dict[str, Any]]] = {}
         self._pending_probes_lock = Lock()
         self._pending_probe_last_prune = 0.0
+        self._failed_extractions_lock = Lock()
+        self._manual_retry_lock = Lock()
+        self._manual_retry_running_ids: set[str] = set()
+        self._manual_retry_progress: Dict[str, Any] = {
+            "running": False,
+            "total": 0,
+            "started": 0,
+            "completed": 0,
+            "success": 0,
+            "failed": 0,
+        }
 
     def init_plugin(self, config: dict = None) -> None:
         config = config or {}
@@ -120,14 +142,15 @@ class FFprobeMediaInfoPersistence(_PluginBase):
             logger.info("【ffprobe媒体信息持久化】插件未启用，不监听整理事件")
         elif workers_changed and self._fallback_executor is not None:
             self._stop_background_tasks()
+        if self._enabled and self._fallback_executor is None:
             self._fallback_executor = ThreadPoolExecutor(
                 max_workers=self._fallback_workers,
                 thread_name_prefix="ffprobe-media-info",
             )
-        elif self._fallback_executor is None:
-            self._fallback_executor = ThreadPoolExecutor(
-                max_workers=self._fallback_workers,
-                thread_name_prefix="ffprobe-media-info",
+        if self._enabled and self._cached_write_executor is None:
+            self._cached_write_executor = ThreadPoolExecutor(
+                max_workers=_CACHE_WRITE_WORKERS,
+                thread_name_prefix="ffprobe-media-info-write",
             )
         if self._enabled:
             logger.info(
@@ -146,7 +169,44 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         return []
 
     def get_api(self) -> List[Dict[str, Any]]:
-        return []
+        return [
+            {
+                "path": "/failed-extractions/select",
+                "endpoint": self.set_failed_extraction_selected,
+                "methods": ["GET"],
+                "summary": "选择或取消选择失败提取记录",
+            },
+            {
+                "path": "/failed-extractions/view",
+                "endpoint": self.set_failed_extractions_view,
+                "methods": ["GET"],
+                "summary": "切换失败提取记录筛选",
+            },
+            {
+                "path": "/failed-extractions/retry-selected",
+                "endpoint": self.retry_selected_failed_extractions,
+                "methods": ["GET"],
+                "summary": "后台重新提取已选择记录",
+            },
+            {
+                "path": "/failed-extractions/delete-selected",
+                "endpoint": self.delete_selected_failed_extractions,
+                "methods": ["GET"],
+                "summary": "删除已选择失败提取记录",
+            },
+            {
+                "path": "/failed-extractions/clear-selection",
+                "endpoint": self.clear_failed_extractions_selection,
+                "methods": ["GET"],
+                "summary": "清除失败提取记录选择",
+            },
+            {
+                "path": "/failed-extractions/refresh-progress",
+                "endpoint": self.refresh_failed_extractions_progress,
+                "methods": ["GET"],
+                "summary": "刷新失败提取任务进度",
+            },
+        ]
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         """按整理流程排序的五行紧凑配置页。"""
@@ -175,7 +235,7 @@ class FFprobeMediaInfoPersistence(_PluginBase):
                 {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
                     {"component": "VSwitch", "props": {
                         "model": "overwrite_json", "label": "覆盖同名 JSON",
-                        "hint": "关闭时保留目标目录中已有的同名 JSON。",
+                        "hint": "目标目录已有同名 JSON 时",
                         "persistent-hint": True,
                     }}]},
             ]},
@@ -223,7 +283,7 @@ class FFprobeMediaInfoPersistence(_PluginBase):
                         "persistent-hint": True,
                     }}]},
             ]},
-            {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "density": "compact", "text": "使用说明：优先复用“ffprobe命名补充”已获取的缓存，缓存命中后立即后台写入 JSON，不限制写入线程。仅缓存缺失时才按“主动提取”配置对最终目标文件运行 ffprobe。上游 ffprobe 未请求章节，因此输出 JSON 的 Chapters 为空。"}},
+            {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "density": "compact", "text": "使用说明：优先复用“ffprobe命名补充”已获取的缓存，缓存命中后立即后台写入 JSON，最多 32 个并发。仅缓存缺失时才按“主动提取”配置对最终目标文件运行 ffprobe。上游 ffprobe 未请求章节，因此输出 JSON 的 Chapters 为空。"}},
             {"component": "VAlert", "props": {"type": "warning", "variant": "tonal", "density": "compact", "text": "JSON清理：文件整理完成后延迟 10 秒检查，若媒体文件已不存在，则清理媒体文件目录下严格同名的 -mediainfo.json 文件。"}},
         ]}], {
             "enabled": False,
@@ -238,8 +298,437 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         }
 
     def get_page(self) -> Optional[List[dict]]:
-        # 与 ffprobe命名补充保持一致：不定义独立详情页。
-        pass
+        """失败提取记录页；所有点击操作经插件 API 完成后自动刷新本页。"""
+        records = self._failed_extractions()
+        view = self._failed_extractions_view()
+        state = view["state"]
+        reason = view["reason"]
+        state_records = [
+            record for record in records
+            if bool(record.get("handled")) == (state == "handled")
+        ]
+        visible_records = [
+            record for record in state_records
+            if not reason or record.get("reason") == reason
+        ]
+        selected_count = sum(1 for record in records if record.get("selected"))
+        pending_count = sum(1 for record in records if not record.get("handled"))
+        handled_count = len(records) - pending_count
+        apikey = settings.API_TOKEN
+        progress = self._manual_retry_progress_text()
+        retry_running = bool(self._manual_retry_progress_snapshot().get("running"))
+
+        def page_action(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+            payload = {"apikey": apikey}
+            if params:
+                payload.update(params)
+            return {"click": {"api": path, "method": "get", "params": payload}}
+
+        status_buttons = []
+        for key, label, count in (
+            ("pending", "未处理", pending_count),
+            ("handled", "已处理", handled_count),
+        ):
+            status_buttons.append({
+                "component": "VBtn",
+                "props": {
+                    "variant": "tonal" if key == state else "text",
+                    "color": "primary" if key == state else "default",
+                    "size": "small",
+                },
+                "text": f"{label}（{count}）",
+                "events": page_action(
+                    "plugin/FFprobeMediaInfoPersistence/failed-extractions/view",
+                    {"state": key, "reason": ""},
+                ),
+            })
+
+        reason_buttons = [{
+            "component": "VBtn",
+            "props": {
+                "variant": "tonal" if not reason else "text",
+                "color": "primary" if not reason else "default",
+                "size": "x-small",
+            },
+            "text": "全部原因",
+            "events": page_action(
+                "plugin/FFprobeMediaInfoPersistence/failed-extractions/view",
+                {"state": state, "reason": ""},
+            ),
+        }]
+        for item_reason in sorted({str(record.get("reason") or "未知错误") for record in state_records}):
+            reason_buttons.append({
+                "component": "VBtn",
+                "props": {
+                    "variant": "tonal" if item_reason == reason else "text",
+                    "color": "primary" if item_reason == reason else "default",
+                    "size": "x-small",
+                },
+                "text": item_reason,
+                "events": page_action(
+                    "plugin/FFprobeMediaInfoPersistence/failed-extractions/view",
+                    {"state": state, "reason": item_reason},
+                ),
+            })
+
+        table_rows: List[dict] = []
+        for record in visible_records:
+            record_id = str(record["id"])
+            selected = bool(record.get("selected"))
+            table_rows.append({
+                "component": "tr",
+                "content": [
+                    {
+                        "component": "td",
+                        "content": [{
+                            "component": "VCheckbox",
+                            "props": {
+                                "modelValue": selected,
+                                "hideDetails": True,
+                                "density": "compact",
+                                "disabled": retry_running,
+                            },
+                            "events": page_action(
+                                "plugin/FFprobeMediaInfoPersistence/failed-extractions/select",
+                                {"record_id": record_id, "selected": "0" if selected else "1"},
+                            ),
+                        }],
+                    },
+                    {"component": "td", "text": str(record.get("first_failed_at") or "-")},
+                    {"component": "td", "text": str(record.get("reason") or "未知错误")},
+                    {"component": "td", "text": str(record.get("attempt_count") or 0)},
+                    {
+                        "component": "td",
+                        "props": {"class": "break-all text-caption"},
+                        "text": str(record.get("destination") or "-"),
+                    },
+                ],
+            })
+
+        action_disabled = selected_count == 0 or retry_running
+        content: List[dict] = [
+            {
+                "component": "VAlert",
+                "props": {
+                    "type": "info",
+                    "variant": "tonal",
+                    "density": "compact",
+                    "text": progress,
+                },
+            },
+            {
+                "component": "div",
+                "props": {"class": "d-flex flex-wrap ga-2"},
+                "content": status_buttons,
+            },
+            {"component": "div", "props": {"class": "d-flex flex-wrap ga-2 mt-3"}, "content": reason_buttons},
+            {
+                "component": "div",
+                "props": {"class": "d-flex flex-wrap align-center ga-2 my-4"},
+                "content": [
+                    {"component": "span", "props": {"class": "text-body-2"}, "text": f"已选 {selected_count} 项"},
+                    {
+                        "component": "VBtn",
+                        "props": {"color": "primary", "size": "small", "disabled": action_disabled},
+                        "text": "重新提取",
+                        "events": page_action("plugin/FFprobeMediaInfoPersistence/failed-extractions/retry-selected"),
+                    },
+                    {
+                        "component": "VBtn",
+                        "props": {"color": "error", "variant": "tonal", "size": "small", "disabled": action_disabled},
+                        "text": "删除记录",
+                        "events": page_action("plugin/FFprobeMediaInfoPersistence/failed-extractions/delete-selected"),
+                    },
+                    {
+                        "component": "VBtn",
+                        "props": {"variant": "text", "size": "small", "disabled": action_disabled},
+                        "text": "取消选择",
+                        "events": page_action("plugin/FFprobeMediaInfoPersistence/failed-extractions/clear-selection"),
+                    },
+                    {
+                        "component": "VBtn",
+                        "props": {"variant": "text", "size": "small"},
+                        "text": "刷新进度",
+                        "events": page_action("plugin/FFprobeMediaInfoPersistence/failed-extractions/refresh-progress"),
+                    },
+                ],
+            },
+        ]
+        if not table_rows:
+            content.append({
+                "component": "VAlert",
+                "props": {
+                    "type": "success",
+                    "variant": "tonal",
+                    "density": "compact",
+                    "text": "当前筛选条件下没有失败提取记录",
+                },
+            })
+        else:
+            content.append({
+                "component": "VTable",
+                "props": {"density": "compact"},
+                "content": [
+                    {"component": "thead", "content": [{"component": "tr", "content": [
+                        {"component": "th", "text": "选择"},
+                        {"component": "th", "text": "首次失败时间"},
+                        {"component": "th", "text": "失败原因"},
+                        {"component": "th", "text": "尝试次数"},
+                        {"component": "th", "text": "目标文件"},
+                    ]}]},
+                    {"component": "tbody", "content": table_rows},
+                ],
+            })
+        content.append({
+            "component": "VAlert",
+            "props": {
+                "type": "warning",
+                "variant": "tonal",
+                "density": "compact",
+                "text": "删除记录仅移除本插件的失败提取记录，不删除媒体文件、MediaInfo JSON 或 MoviePilot 整理历史",
+            },
+        })
+        return [{"component": "div", "props": {"class": "d-flex flex-column ga-3"}, "content": content}]
+
+    @staticmethod
+    def _failure_record_id(destination: str) -> str:
+        return sha1(str(Path(destination)).casefold().encode("utf-8")).hexdigest()
+
+    def _failed_extractions(self) -> List[Dict[str, Any]]:
+        """读取并规范化失败提取记录，兼容旧数据或局部损坏数据。"""
+        raw_records = self.get_data(_FAILED_EXTRACTIONS_DATA_KEY) or []
+        if not isinstance(raw_records, list):
+            return []
+        records: List[Dict[str, Any]] = []
+        for raw in raw_records:
+            if not isinstance(raw, dict) or not raw.get("destination"):
+                continue
+            destination = str(raw["destination"])
+            records.append({
+                "id": str(raw.get("id") or type(self)._failure_record_id(destination)),
+                "destination": destination,
+                "first_failed_at": str(raw.get("first_failed_at") or "-"),
+                "reason": str(raw.get("reason") or "未知错误"),
+                "attempt_count": max(0, type(self)._integer(raw.get("attempt_count"), 0) or 0),
+                "handled": bool(raw.get("handled")),
+                "selected": bool(raw.get("selected")),
+            })
+        return records
+
+    def _save_failed_extractions(self, records: List[Dict[str, Any]]) -> None:
+        self.save_data(_FAILED_EXTRACTIONS_DATA_KEY, records[-_MAX_FAILED_EXTRACTION_RECORDS:])
+
+    def _failed_extractions_view(self) -> Dict[str, str]:
+        raw_view = self.get_data(_FAILED_EXTRACTIONS_VIEW_KEY) or {}
+        state = str(raw_view.get("state") if isinstance(raw_view, dict) else "pending")
+        return {
+            "state": state if state in {"pending", "handled"} else "pending",
+            "reason": str(raw_view.get("reason") or "") if isinstance(raw_view, dict) else "",
+        }
+
+    def _save_failed_extractions_view(self, state: str, reason: str) -> None:
+        self.save_data(_FAILED_EXTRACTIONS_VIEW_KEY, {"state": state, "reason": reason})
+
+    @staticmethod
+    def _api_authorized(apikey: Optional[str]) -> bool:
+        return bool(apikey) and apikey == settings.API_TOKEN
+
+    def _api_denied(self) -> Any:
+        return schemas.Response(success=False, message="API 密钥错误")
+
+    def set_failed_extraction_selected(
+        self, record_id: str, selected: str, apikey: Optional[str] = None
+    ) -> Any:
+        if not self._api_authorized(apikey):
+            return self._api_denied()
+        selected_value = str(selected).lower() in {"1", "true", "yes", "on"}
+        with self._failed_extractions_lock:
+            records = self._failed_extractions()
+            found = False
+            for record in records:
+                if record["id"] == record_id:
+                    record["selected"] = selected_value
+                    found = True
+                    break
+            if found:
+                self._save_failed_extractions(records)
+        return schemas.Response(success=found, message="已更新选择" if found else "未找到失败记录")
+
+    def set_failed_extractions_view(
+        self, state: str = "pending", reason: str = "", apikey: Optional[str] = None
+    ) -> Any:
+        if not self._api_authorized(apikey):
+            return self._api_denied()
+        normalized_state = state if state in {"pending", "handled"} else "pending"
+        with self._failed_extractions_lock:
+            records = self._failed_extractions()
+            for record in records:
+                record["selected"] = False
+            self._save_failed_extractions(records)
+            self._save_failed_extractions_view(normalized_state, reason)
+        return schemas.Response(success=True, message="已切换筛选条件")
+
+    def clear_failed_extractions_selection(self, apikey: Optional[str] = None) -> Any:
+        if not self._api_authorized(apikey):
+            return self._api_denied()
+        with self._failed_extractions_lock:
+            records = self._failed_extractions()
+            for record in records:
+                record["selected"] = False
+            self._save_failed_extractions(records)
+        return schemas.Response(success=True, message="已取消选择")
+
+    def refresh_failed_extractions_progress(self, apikey: Optional[str] = None) -> Any:
+        """数据页点击后由 MP 重新渲染页面，从而显示后台任务的最新进度。"""
+        if not self._api_authorized(apikey):
+            return self._api_denied()
+        return schemas.Response(success=True, message="已刷新重新提取进度")
+
+    def delete_selected_failed_extractions(self, apikey: Optional[str] = None) -> Any:
+        """只删除插件自身的失败记录；不触碰媒体、JSON 或 MP 整理历史。"""
+        if not self._api_authorized(apikey):
+            return self._api_denied()
+        if self._manual_retry_progress_snapshot().get("running"):
+            return schemas.Response(success=False, message="重新提取进行中，请完成后再删除记录")
+        with self._failed_extractions_lock:
+            records = self._failed_extractions()
+            kept_records = [record for record in records if not record.get("selected")]
+            deleted = len(records) - len(kept_records)
+            self._save_failed_extractions(kept_records)
+        return schemas.Response(success=True, message=f"已删除 {deleted} 条插件失败记录")
+
+    def _manual_retry_progress_snapshot(self) -> Dict[str, Any]:
+        with self._manual_retry_lock:
+            return dict(self._manual_retry_progress)
+
+    def _manual_retry_progress_text(self) -> str:
+        progress = self._manual_retry_progress_snapshot()
+        if progress.get("running"):
+            return (
+                f"重新提取进行中：共 {progress['total']} 个文件，已开始 {progress['started']} 个，"
+                f"已完成 {progress['completed']} 个，成功 {progress['success']} 个，失败 {progress['failed']} 个"
+            )
+        if progress.get("total"):
+            return (
+                f"上次重新提取：共 {progress['total']} 个文件，成功 {progress['success']} 个，"
+                f"失败 {progress['failed']} 个"
+            )
+        return "选择失败记录后点击“重新提取”，任务将在后台运行，关闭此页面不影响执行"
+
+    def retry_selected_failed_extractions(self, apikey: Optional[str] = None) -> Any:
+        """将已选失败记录交给现有主动提取线程池，接口立即返回、不阻塞页面。"""
+        if not self._api_authorized(apikey):
+            return self._api_denied()
+        if not self._enabled:
+            return schemas.Response(success=False, message="插件未启用，无法重新提取")
+        executor = self._fallback_executor
+        if executor is None:
+            return schemas.Response(success=False, message="主动提取器未启动")
+        with self._failed_extractions_lock:
+            selected_records = [
+                dict(record) for record in self._failed_extractions() if record.get("selected")
+            ]
+        if not selected_records:
+            return schemas.Response(success=False, message="请先选择至少一条失败记录")
+        with self._manual_retry_lock:
+            if self._manual_retry_progress.get("running"):
+                return schemas.Response(success=False, message="已有重新提取任务正在后台运行")
+            selected_records = [
+                record for record in selected_records
+                if record["id"] not in self._manual_retry_running_ids
+            ]
+            if not selected_records:
+                return schemas.Response(success=False, message="所选记录正在重新提取")
+            self._manual_retry_running_ids.update(record["id"] for record in selected_records)
+            self._manual_retry_progress = {
+                "running": True,
+                "total": len(selected_records),
+                "started": 0,
+                "completed": 0,
+                "success": 0,
+                "failed": 0,
+            }
+        for record in selected_records:
+            future = executor.submit(self._manual_retry_one, record)
+            with self._fallback_tasks_lock:
+                self._fallback_tasks.add(future)
+            future.add_done_callback(self._on_background_task_done)
+        logger.info("【ffprobe媒体信息持久化】已提交 %s 个手动重新提取任务", len(selected_records))
+        return schemas.Response(success=True, message=f"已在后台提交 {len(selected_records)} 个重新提取任务")
+
+    def _manual_retry_one(self, record: Dict[str, Any]) -> None:
+        """执行单条手动重试；成功即移除失败记录，失败转入已处理并增加尝试次数。"""
+        record_id = str(record["id"])
+        destination = Path(str(record["destination"]))
+        with self._manual_retry_lock:
+            self._manual_retry_progress["started"] += 1
+        success = False
+        failure_reason = "未知错误"
+        try:
+            if not destination.is_file():
+                failure_reason = "整理目标不存在"
+            else:
+                probe, failure_reason = type(self)._run_fallback_ffprobe_detail(
+                    str(destination), self._fallback_timeout
+                )
+                if isinstance(probe, dict):
+                    success = self._persist(destination, probe, "手动重新提取")
+                    if not success:
+                        failure_reason = "JSON 写入失败"
+        except Exception as error:
+            failure_reason = "主动提取执行错误"
+            logger.warning("【ffprobe媒体信息持久化】手动重新提取异常 path=%s error=%s", destination, error)
+        if success:
+            self._remove_failed_extraction(record_id)
+        else:
+            self._mark_manual_retry_failed(record_id, failure_reason)
+        with self._manual_retry_lock:
+            self._manual_retry_running_ids.discard(record_id)
+            self._manual_retry_progress["completed"] += 1
+            self._manual_retry_progress["success" if success else "failed"] += 1
+            if self._manual_retry_progress["completed"] >= self._manual_retry_progress["total"]:
+                self._manual_retry_progress["running"] = False
+
+    def _record_failed_extraction(self, destination: Path, reason: str) -> None:
+        """记录“上游缓存缺失且主动提取失败”的首次失败；保留首次失败时间。"""
+        destination_text = str(destination)
+        record_id = type(self)._failure_record_id(destination_text)
+        with self._failed_extractions_lock:
+            records = self._failed_extractions()
+            for record in records:
+                if record["id"] == record_id:
+                    record["reason"] = reason
+                    self._save_failed_extractions(records)
+                    return
+            records.append({
+                "id": record_id,
+                "destination": destination_text,
+                "first_failed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "reason": reason,
+                "attempt_count": 0,
+                "handled": False,
+                "selected": False,
+            })
+            self._save_failed_extractions(records)
+
+    def _mark_manual_retry_failed(self, record_id: str, reason: str) -> None:
+        with self._failed_extractions_lock:
+            records = self._failed_extractions()
+            for record in records:
+                if record["id"] == record_id:
+                    record["handled"] = True
+                    record["selected"] = False
+                    record["reason"] = reason
+                    record["attempt_count"] = int(record.get("attempt_count") or 0) + 1
+                    break
+            self._save_failed_extractions(records)
+
+    def _remove_failed_extraction(self, record_id: str) -> None:
+        with self._failed_extractions_lock:
+            records = self._failed_extractions()
+            self._save_failed_extractions([
+                record for record in records if record["id"] != record_id
+            ])
 
     def stop_service(self) -> None:
         self._clear_pending_probes()
@@ -251,21 +740,37 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         self._fallback_executor = None
         if executor is not None:
             executor.shutdown(wait=False, cancel_futures=True)
+        cached_write_executor = self._cached_write_executor
+        self._cached_write_executor = None
+        if cached_write_executor is not None:
+            cached_write_executor.shutdown(wait=False, cancel_futures=True)
         with self._fallback_tasks_lock:
             self._fallback_tasks.clear()
+        with self._cached_write_tasks_lock:
+            self._cached_write_tasks.clear()
         with self._cleanup_timers_lock:
             for timer in self._cleanup_timers:
                 timer.cancel()
             self._cleanup_timers.clear()
 
     def _submit_cached_persist(self, destination: Path, probe: Dict[str, Any]) -> None:
-        """每个缓存命中的文件直接启动写入线程，不参与 ffprobe 兜底限流。"""
-        Thread(
-            target=self._persist,
-            args=(destination, probe, "复用上游缓存"),
-            name="ffprobe-media-info-write",
-            daemon=True,
-        ).start()
+        """命中缓存后立即提交独立写入池，不占用主动 ffprobe 并发。"""
+        executor = self._cached_write_executor
+        if executor is None:
+            logger.warning("【ffprobe媒体信息持久化】JSON 写入器未启动，跳过：%s", destination)
+            return
+        future = executor.submit(self._persist, destination, probe, "复用上游缓存")
+        with self._cached_write_tasks_lock:
+            self._cached_write_tasks.add(future)
+        future.add_done_callback(self._on_cached_write_done)
+
+    def _on_cached_write_done(self, future: Future) -> None:
+        with self._cached_write_tasks_lock:
+            self._cached_write_tasks.discard(future)
+        try:
+            future.result()
+        except Exception as error:
+            logger.warning("【ffprobe媒体信息持久化】后台 JSON 写入任务异常：%s", error)
 
     def _submit_fallback_task(self, destination: Path) -> None:
         """提交后台兜底探测，不阻塞 MP 当前整理事件。"""
@@ -290,14 +795,17 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         """对已整理到位的目标文件执行一次 10 秒兜底探测并写入 JSON。"""
         if not destination.is_file():
             logger.warning("【ffprobe媒体信息持久化】后台提取时目标不存在，跳过：%s", destination)
+            self._record_failed_extraction(destination, "整理目标不存在")
             return
-        probe = type(self)._run_fallback_ffprobe(
+        probe, failure_reason = type(self)._run_fallback_ffprobe_detail(
             str(destination), self._fallback_timeout
         )
         if not isinstance(probe, dict):
             logger.warning("【ffprobe媒体信息持久化】后台 ffprobe 未得到结果，跳过：%s", destination)
+            self._record_failed_extraction(destination, failure_reason)
             return
-        self._persist(destination, probe, "主动提取")
+        if not self._persist(destination, probe, "主动提取"):
+            self._record_failed_extraction(destination, "JSON 写入失败")
 
     def _clear_pending_probes(self) -> None:
         with self._pending_probes_lock:
@@ -581,6 +1089,14 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         cls, media_path: str, timeout: int
     ) -> Optional[Dict[str, Any]]:
         """缓存缺失时的唯一兜底：按配置超时执行一次 ffprobe。"""
+        result, _ = cls._run_fallback_ffprobe_detail(media_path, timeout)
+        return result
+
+    @classmethod
+    def _run_fallback_ffprobe_detail(
+        cls, media_path: str, timeout: int
+    ) -> Tuple[Optional[Dict[str, Any]], str]:
+        """执行一次主动 ffprobe，并返回可供失败记录筛选的简短失败原因。"""
         probe_target = media_path
         naming_plugins = cls._naming_plugin_classes()
         if naming_plugins:
@@ -589,7 +1105,7 @@ class FFprobeMediaInfoPersistence(_PluginBase):
             except Exception:
                 probe_target = media_path
         if not probe_target:
-            return None
+            return None, "无法读取 STRM 目标"
         try:
             process = run(
                 [
@@ -606,19 +1122,21 @@ class FFprobeMediaInfoPersistence(_PluginBase):
                 timeout,
                 probe_target,
             )
-            return None
+            return None, "主动提取超时"
         except OSError as error:
             logger.warning("【ffprobe媒体信息持久化】无法执行兜底 ffprobe：%s", error)
-            return None
+            return None, "主动提取执行错误"
         if process.returncode != 0:
             logger.debug("【ffprobe媒体信息持久化】兜底 ffprobe 失败 rc=%s target=%s err=%s", process.returncode, probe_target, (process.stderr or "")[:500])
-            return None
+            return None, "主动提取失败"
         try:
             result = json.loads(process.stdout)
         except (TypeError, json.JSONDecodeError) as error:
             logger.warning("【ffprobe媒体信息持久化】兜底 ffprobe JSON 解析失败：%s", error)
-            return None
-        return result if isinstance(result, dict) else None
+            return None, "主动提取 JSON 解析失败"
+        if not isinstance(result, dict):
+            return None, "主动提取返回无效结果"
+        return result, ""
 
     @eventmanager.register(ChainEventType.TransferRenameBuild)
     def on_transfer_rename_build(self, event: Event) -> None:
@@ -698,22 +1216,22 @@ class FFprobeMediaInfoPersistence(_PluginBase):
             # 清理放在该条整理记录的处理末尾；不受生成 JSON 筛选条件影响。
             self._schedule_source_json_cleanup(source_path)
 
-    def _persist(self, destination: Path, probe: Dict[str, Any], source: str) -> None:
+    def _persist(self, destination: Path, probe: Dict[str, Any], source: str) -> bool:
         if not destination.is_file():
             logger.warning("【ffprobe媒体信息持久化】整理目标不存在，跳过：%s", destination)
-            return
+            return False
         json_path = destination.with_name(destination.stem + _MEDIA_INFO_SUFFIX)
         path_key = str(json_path).casefold()
         with self._writing_json_paths_lock:
             # 同一条整理记录被 MP 重试或重复投递时，仅允许一个线程写同一 JSON。
             if path_key in self._writing_json_paths:
                 logger.debug("【ffprobe媒体信息持久化】同名 JSON 正在写入，跳过重复任务：%s", json_path)
-                return
+                return True
             self._writing_json_paths.add(path_key)
         try:
             if json_path.exists() and not self._overwrite_json:
                 logger.info("【ffprobe媒体信息持久化】JSON 已存在，按配置不覆盖：%s", json_path)
-                return
+                return True
             document = type(self)._to_emby_document(probe)
             temporary = json_path.with_suffix(json_path.suffix + ".tmp")
             temporary.write_text(
@@ -722,8 +1240,10 @@ class FFprobeMediaInfoPersistence(_PluginBase):
             )
             temporary.replace(json_path)
             logger.info("【ffprobe媒体信息持久化】已保存 MediaInfo JSON（%s）：%s", source, json_path)
+            return True
         except OSError as error:
             logger.warning("【ffprobe媒体信息持久化】写入 JSON 失败 path=%s error=%s", json_path, error)
+            return False
         finally:
             with self._writing_json_paths_lock:
                 self._writing_json_paths.discard(path_key)
@@ -775,6 +1295,12 @@ class FFprobeMediaInfoPersistence(_PluginBase):
             if normalized:
                 return normalized
         return None
+
+    @classmethod
+    def _media_size(cls, value: Any) -> int:
+        """远程 STRM 的 format.size 常为接口响应长度，过小时按未知大小输出。"""
+        size = cls._integer(value, 0) or 0
+        return size if size >= _MIN_RELIABLE_MEDIA_SIZE_BYTES else 0
 
     @classmethod
     def _video_range(cls, stream: Dict[str, Any]) -> str:
@@ -858,7 +1384,7 @@ class FFprobeMediaInfoPersistence(_PluginBase):
             "Protocol": "File",
             "Type": "Default",
             "Container": cls._container(format_info.get("format_name")),
-            "Size": cls._integer(format_info.get("size"), 0),
+            "Size": cls._media_size(format_info.get("size")),
             "IsRemote": True,
             "HasMixedProtocols": False,
             "RunTimeTicks": int(cls._number(format_info.get("duration")) * 10_000_000),
@@ -878,7 +1404,6 @@ class FFprobeMediaInfoPersistence(_PluginBase):
             "ReadAtNativeFramerate": False,
         }
         return [{"MediaSourceInfo": source, "Chapters": [], "ZeroFingerprintConfidence": False}]
-
 
 # 原插件已使用 re.search；为保持依赖最小，这里保留模块级别别名。
 re_search = re.search
