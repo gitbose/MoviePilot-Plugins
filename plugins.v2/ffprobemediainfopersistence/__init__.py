@@ -547,8 +547,18 @@ class FFprobeMediaInfoPersistence(_PluginBase):
                 "type": "warning",
                 "variant": "tonal",
                 "density": "compact",
-                "text": "删除记录仅移除本插件的失败提取记录，不删除媒体文件、MediaInfo JSON 或 MoviePilot 整理历史；异常大小栏是已进行生成json文件",
             },
+            "content": [
+                {
+                    "component": "span",
+                    "text": "删除记录仅移除本插件的失败提取记录，不删除媒体文件、MediaInfo JSON 或 MoviePilot 整理历史；异常大小栏是",
+                },
+                {"component": "strong", "text": "ffprobe"},
+                {
+                    "component": "span",
+                    "text": "读取后，json信息的 Size < 1MB 的文件",
+                },
+            ],
         })
         return [{"component": "div", "props": {"class": "d-flex flex-column ga-3"}, "content": content}]
 
