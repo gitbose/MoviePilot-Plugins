@@ -221,8 +221,12 @@ class FFprobeMediaInfoPersistence(_PluginBase):
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         """按整理流程排序的五行紧凑配置页。"""
-        return [{"component": "VForm", "content": [
-            {"component": "VRow", "props": {"class": "mb-4"}, "content": [
+        return [{"component": "VForm", "props": {"class": "ffprobe-media-info-config"}, "content": [
+            {
+                "component": "style",
+                "text": ".ffprobe-media-info-config .v-messages__message { line-height: 1rem !important; }",
+            },
+            {"component": "VRow", "content": [
                 {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
                     {"component": "VSwitch", "props": {
                         "model": "enabled", "label": "启用插件",
@@ -236,7 +240,7 @@ class FFprobeMediaInfoPersistence(_PluginBase):
                         "persistent-hint": True,
                     }}]},
             ]},
-            {"component": "VRow", "props": {"class": "mb-4"}, "content": [
+            {"component": "VRow", "content": [
                 {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
                     {"component": "VSwitch", "props": {
                         "model": "fallback_probe", "label": "上游缓存缺失时主动提取",
@@ -256,7 +260,7 @@ class FFprobeMediaInfoPersistence(_PluginBase):
                         "persistent-hint": True,
                     }}]},
             ]},
-            {"component": "VRow", "props": {"class": "mb-4"}, "content": [
+            {"component": "VRow", "content": [
                 {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
                     {"component": "VTextField", "props": {
                         "model": "fallback_workers", "label": "主动提取并发数",
@@ -282,7 +286,7 @@ class FFprobeMediaInfoPersistence(_PluginBase):
                         "persistent-hint": True,
                     }}]},
             ]},
-            {"component": "VRow", "props": {"class": "mb-4"}, "content": [
+            {"component": "VRow", "content": [
                 {"component": "VCol", "props": {"cols": 12}, "content": [
                     {"component": "VTextarea", "props": {
                         "model": "transfer_methods", "label": "限定整理方式（可选，一行一个）",
@@ -291,7 +295,7 @@ class FFprobeMediaInfoPersistence(_PluginBase):
                         "persistent-hint": True,
                     }}]},
             ]},
-            {"component": "VRow", "props": {"class": "mb-4"}, "content": [
+            {"component": "VRow", "content": [
                 {"component": "VCol", "props": {"cols": 12}, "content": [
                     {"component": "VTextarea", "props": {
                         "model": "destination_roots", "label": "限定整理目标路径（可选，一行一个）",
@@ -551,12 +555,12 @@ class FFprobeMediaInfoPersistence(_PluginBase):
             "content": [
                 {
                     "component": "span",
-                    "text": "删除记录仅移除本插件的失败提取记录，不删除媒体文件、MediaInfo JSON 或 MoviePilot 整理历史；异常大小栏是",
+                    "text": "删除记录仅移除本插件的失败提取记录，不删除媒体文件、MoviePilot 整理历史；异常大小栏是 ",
                 },
-                {"component": "strong", "text": "ffprobe"},
+                {"component": "strong", "text": "ffprobe "},
                 {
                     "component": "span",
-                    "text": "读取后，json信息的 Size < 1MB 的文件",
+                    "text": "读取后，json信息的 Size < 1MB 的文件记录",
                 },
             ],
         })
