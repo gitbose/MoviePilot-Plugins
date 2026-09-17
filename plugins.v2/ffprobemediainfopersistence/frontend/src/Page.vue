@@ -17,7 +17,8 @@ const total = ref(0)
 const rows = ref([])
 const reasons = ref([])
 const counts = ref({ pending: 0, handled: 0, abnormal_size: 0, abnormal_size_pending: 0 })
-const progressText = ref('选择失败记录后点击“重新提取”，任务将在后台运行，关闭此页面不影响执行')
+const progressText = ref('所有任务后台运行，关闭此页面不影响执行；删除记录仅移除当前页面的运行记录；异常大小栏是 ffprobe 读取后，json信息的 Size < 1MB 的文件记录')
+const progress = ref({ total: 0, running: false })
 const retryRunning = ref(false)
 const loading = ref(false)
 const actionRunning = ref(false)
@@ -25,6 +26,7 @@ const error = ref('')
 const notice = ref('')
 const selectedIds = ref(new Set())
 const requestedPage = ref('')
+const currentFilterIds = ref(new Set())
 
 const statusTabs = computed(() => [
   { key: 'pending', label: '未处理', count: counts.value.pending || 0 },
@@ -36,6 +38,10 @@ const statusTabs = computed(() => [
 const selectedCount = computed(() => selectedIds.value.size)
 const pageIds = computed(() => rows.value.map(row => String(row.id)))
 const pageAllSelected = computed(() => pageIds.value.length > 0 && pageIds.value.every(id => selectedIds.value.has(id)))
+const currentFilterAllSelected = computed(() => (
+  currentFilterIds.value.size > 0
+  && [...currentFilterIds.value].every(id => selectedIds.value.has(id))
+))
 
 function unwrap(response) {
   const body = response && Object.prototype.hasOwnProperty.call(response, 'success')
@@ -78,6 +84,7 @@ async function loadPage({ resetPage = false } = {}) {
     reasons.value = Array.isArray(payload.reasons) ? payload.reasons : []
     counts.value = payload.counts || counts.value
     progressText.value = String(payload.progress_text || progressText.value)
+    progress.value = payload.progress || { total: 0, running: false }
     retryRunning.value = Boolean(payload.progress?.running)
     requestedPage.value = String(page.value)
   } catch (requestError) {
@@ -105,11 +112,19 @@ async function selectCurrentFilter() {
   actionRunning.value = true
   error.value = ''
   try {
+    const next = new Set(selectedIds.value)
+    if (currentFilterAllSelected.value) {
+      currentFilterIds.value.forEach(id => next.delete(id))
+      currentFilterIds.value = new Set()
+      selectedIds.value = next
+      return
+    }
     const payload = unwrap(await props.api.get(
       `${apiBase}/ids${queryString({ state: state.value, reason: reason.value })}`,
     ))
-    const next = new Set(selectedIds.value)
-    for (const id of (Array.isArray(payload.ids) ? payload.ids : [])) next.add(String(id))
+    const ids = new Set((Array.isArray(payload.ids) ? payload.ids : []).map(String))
+    ids.forEach(id => next.add(id))
+    currentFilterIds.value = ids
     selectedIds.value = next
   } catch (requestError) {
     error.value = requestError?.message || '全选当前筛选失败'
@@ -118,18 +133,16 @@ async function selectCurrentFilter() {
   }
 }
 
-function clearSelection() {
-  selectedIds.value = new Set()
-}
-
 function switchState(nextState) {
   state.value = nextState
   reason.value = ''
+  currentFilterIds.value = new Set()
   loadPage({ resetPage: true })
 }
 
 function switchReason(nextReason) {
   reason.value = nextReason
+  currentFilterIds.value = new Set()
   loadPage({ resetPage: true })
 }
 
@@ -155,7 +168,6 @@ function pageRange() {
 
 async function submitSelected(action) {
   if (!selectedCount.value || actionRunning.value) return
-  if (action === 'delete' && !window.confirm(`确定仅删除选中的 ${selectedCount.value} 条插件记录吗？不会删除媒体文件或 JSON。`)) return
   actionRunning.value = true
   error.value = ''
   notice.value = ''
@@ -166,12 +178,26 @@ async function submitSelected(action) {
     notice.value = result.message || (action === 'retry' ? '已提交后台重新提取' : '已删除插件记录')
     toast?.success?.(notice.value)
     selectedIds.value = new Set()
+    currentFilterIds.value = new Set()
     await loadPage()
   } catch (requestError) {
     error.value = requestError?.message || (action === 'retry' ? '重新提取提交失败' : '删除记录失败')
   } finally {
     actionRunning.value = false
   }
+}
+
+const deleteDialog = ref(false)
+
+function requestDelete() {
+  if (selectedCount.value && !actionRunning.value && !retryRunning.value) {
+    deleteDialog.value = true
+  }
+}
+
+async function confirmDelete() {
+  deleteDialog.value = false
+  await submitSelected('delete')
 }
 
 function rowDetail(row) {
@@ -186,6 +212,9 @@ onMounted(() => loadPage())
 <template>
   <div class="ffprobe-records plugin-root">
     <v-alert type="info" variant="tonal" density="compact" class="mb-3">
+      所有任务后台运行，关闭此页面不影响执行；删除记录仅移除当前页面的运行记录；异常大小栏是 <strong>ffprobe </strong>读取后，json信息的 Size &lt; 1MB 的文件记录
+    </v-alert>
+    <v-alert v-if="progress.total" type="info" variant="tonal" density="compact" class="mb-3">
       {{ progressText }}
     </v-alert>
     <v-alert v-if="notice" type="success" variant="tonal" density="compact" class="mb-3">
@@ -235,10 +264,8 @@ onMounted(() => loadPage())
     <div class="d-flex flex-wrap align-center ga-2 mb-4">
       <span class="text-body-2">已选 {{ selectedCount }} 项</span>
       <v-btn color="primary" size="small" :disabled="!selectedCount || actionRunning || retryRunning" @click="submitSelected('retry')">重新提取</v-btn>
-      <v-btn color="error" variant="tonal" size="small" :disabled="!selectedCount || actionRunning || retryRunning" @click="submitSelected('delete')">删除记录</v-btn>
-      <v-btn size="small" variant="text" :disabled="!selectedCount || actionRunning" @click="clearSelection">取消选择</v-btn>
-      <v-btn size="small" variant="text" :disabled="!rows.length || actionRunning || retryRunning" @click="togglePageSelection">{{ pageAllSelected ? '取消本页全选' : '全选本页' }}</v-btn>
-      <v-btn size="small" variant="text" :disabled="!total || actionRunning || retryRunning" @click="selectCurrentFilter">全选当前筛选</v-btn>
+      <v-btn color="error" variant="tonal" size="small" :disabled="!selectedCount || actionRunning || retryRunning" @click="requestDelete">删除记录</v-btn>
+      <v-btn size="small" variant="text" :disabled="!total || actionRunning || retryRunning" @click="selectCurrentFilter">{{ currentFilterAllSelected ? '取消全选当前筛选' : '全选当前筛选' }}</v-btn>
       <v-btn size="small" variant="text" :disabled="loading || actionRunning" @click="loadPage">刷新进度</v-btn>
     </div>
 
@@ -265,9 +292,16 @@ onMounted(() => loadPage())
       </tbody>
     </v-table>
 
-    <v-alert type="warning" variant="tonal" density="compact" class="mt-4">
-      删除记录仅移除本插件的失败提取记录，不删除媒体文件、MoviePilot 整理历史；异常大小栏是 <strong>ffprobe </strong>读取后，json信息的 Size &lt; 1MB 的文件记录
-    </v-alert>
+    <v-dialog v-model="deleteDialog" max-width="30rem" persistent>
+      <v-card title="删除记录确认">
+        <v-card-text>确定仅删除选中的 {{ selectedCount }} 条插件记录吗？不会删除媒体文件、MediaInfo JSON 或 MoviePilot 整理历史</v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" @click="deleteDialog = false">取消</v-btn>
+          <v-btn color="error" variant="flat" @click="confirmDelete">删除记录</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
   </div>
 </template>
 
