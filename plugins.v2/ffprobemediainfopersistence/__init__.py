@@ -39,6 +39,8 @@ _PENDING_PROBE_PRUNE_INTERVAL_SEC = 300
 _FAILED_EXTRACTIONS_DATA_KEY = "failed_extractions"
 _FAILED_EXTRACTIONS_VIEW_KEY = "failed_extractions_view"
 _MAX_FAILED_EXTRACTION_RECORDS = 2000
+_FAILED_EXTRACTION_PAGE_SIZES = (50, 100, 300, 500, 1000)
+_DEFAULT_FAILED_EXTRACTION_PAGE_SIZE = 50
 _CACHE_WRITE_WORKERS = 32
 _RECORD_CATEGORY_FAILURE = "failure"
 _RECORD_CATEGORY_ABNORMAL_SIZE = "abnormal_size"
@@ -57,7 +59,7 @@ class FFprobeMediaInfoPersistence(_PluginBase):
     plugin_name = "ffprobe媒体信息持久化"
     plugin_desc = "复用 ffprobe命名补充的媒体信息并持久化为 Emby MediaInfo JSON。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/refs/heads/main/icons/ffmpeg.png"
-    plugin_version = "1.1"
+    plugin_version = "1.0.0"
     plugin_author = "gitbose"
     author_url = "https://github.com/gitbose"
     plugin_config_prefix = "ffprobemediainfopersistence_"
@@ -182,10 +184,44 @@ class FFprobeMediaInfoPersistence(_PluginBase):
     def get_api(self) -> List[Dict[str, Any]]:
         return [
             {
+                "path": "/failed-extractions/list",
+                "endpoint": self.get_failed_extractions_page,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "分页读取失败提取记录",
+            },
+            {
+                "path": "/failed-extractions/ids",
+                "endpoint": self.get_failed_extraction_ids,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "读取当前筛选记录 ID",
+            },
+            {
+                "path": "/failed-extractions/retry",
+                "endpoint": self.retry_failed_extractions,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "后台重新提取指定记录",
+            },
+            {
+                "path": "/failed-extractions/delete",
+                "endpoint": self.delete_failed_extractions,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "删除指定插件记录",
+            },
+            {
                 "path": "/failed-extractions/select",
                 "endpoint": self.set_failed_extraction_selected,
                 "methods": ["GET"],
                 "summary": "选择或取消选择失败提取记录",
+            },
+            {
+                "path": "/failed-extractions/select-scope",
+                "endpoint": self.select_failed_extraction_scope,
+                "methods": ["GET"],
+                "summary": "选择当前页或当前筛选条件下的失败提取记录",
             },
             {
                 "path": "/failed-extractions/view",
@@ -218,6 +254,11 @@ class FFprobeMediaInfoPersistence(_PluginBase):
                 "summary": "刷新失败提取任务进度",
             },
         ]
+
+    @staticmethod
+    def get_render_mode() -> Tuple[str, str]:
+        """记录页使用 Vue 本地状态，避免逐条勾选触发宿主页面刷新。"""
+        return "vue", "dist/assets"
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         """按整理流程排序的五行紧凑配置页。"""
@@ -331,24 +372,14 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         view = self._failed_extractions_view()
         state = view["state"]
         reason = view["reason"]
-        if state in {
-            _RECORD_CATEGORY_ABNORMAL_SIZE,
-            _RECORD_CATEGORY_ABNORMAL_SIZE_PENDING,
-        }:
-            state_records = [
-                record for record in records
-                if record.get("category") == state
-            ]
-        else:
-            state_records = [
-                record for record in records
-                if record.get("category") == _RECORD_CATEGORY_FAILURE
-                and bool(record.get("handled")) == (state == "handled")
-            ]
-        visible_records = [
-            record for record in state_records
-            if not reason or record.get("reason") == reason
-        ]
+        state_records = type(self)._records_for_state(records, state)
+        filtered_records = type(self)._records_for_reason(state_records, reason)
+        page_size = int(view["page_size"])
+        total_records = len(filtered_records)
+        page_count = max(1, (total_records + page_size - 1) // page_size)
+        page = min(max(1, int(view["page"])), page_count)
+        page_start = (page - 1) * page_size
+        visible_records = filtered_records[page_start:page_start + page_size]
         selected_count = sum(1 for record in records if record.get("selected"))
         pending_count = sum(
             1 for record in records
@@ -397,7 +428,7 @@ class FFprobeMediaInfoPersistence(_PluginBase):
                 "text": f"{label}（{count}）",
                 "events": page_action(
                     "plugin/FFprobeMediaInfoPersistence/failed-extractions/view",
-                    {"state": key, "reason": ""},
+                    {"state": key, "reason": "", "page": 1, "page_size": page_size},
                 ),
             })
 
@@ -411,7 +442,7 @@ class FFprobeMediaInfoPersistence(_PluginBase):
             "text": "全部原因",
             "events": page_action(
                 "plugin/FFprobeMediaInfoPersistence/failed-extractions/view",
-                {"state": state, "reason": ""},
+                {"state": state, "reason": "", "page": 1, "page_size": page_size},
             ),
         }]
         for item_reason in sorted({str(record.get("reason") or "未知错误") for record in state_records}):
@@ -425,9 +456,74 @@ class FFprobeMediaInfoPersistence(_PluginBase):
                 "text": item_reason,
                 "events": page_action(
                     "plugin/FFprobeMediaInfoPersistence/failed-extractions/view",
-                    {"state": state, "reason": item_reason},
+                    {"state": state, "reason": item_reason, "page": 1, "page_size": page_size},
                 ),
             })
+
+        page_size_buttons: List[dict] = []
+        for size in _FAILED_EXTRACTION_PAGE_SIZES:
+            page_size_buttons.append({
+                "component": "VBtn",
+                "props": {
+                    "variant": "tonal" if size == page_size else "text",
+                    "color": "primary" if size == page_size else "default",
+                    "size": "x-small",
+                },
+                "text": f"每页 {size} 条",
+                "events": page_action(
+                    "plugin/FFprobeMediaInfoPersistence/failed-extractions/view",
+                    {"state": state, "reason": reason, "page": 1, "page_size": size},
+                ),
+            })
+
+        page_numbers = {1, page_count}
+        page_numbers.update(
+            candidate for candidate in range(page - 2, page + 3)
+            if 1 <= candidate <= page_count
+        )
+        pagination_buttons: List[dict] = [
+            {
+                "component": "VBtn",
+                "props": {"size": "x-small", "variant": "text", "disabled": page <= 1},
+                "text": "上一页",
+                "events": page_action(
+                    "plugin/FFprobeMediaInfoPersistence/failed-extractions/view",
+                    {"state": state, "reason": reason, "page": page - 1, "page_size": page_size},
+                ),
+            }
+        ]
+        previous_page = 0
+        for number in sorted(page_numbers):
+            if previous_page and number - previous_page > 1:
+                pagination_buttons.append({
+                    "component": "span", "props": {"class": "text-caption"}, "text": "…"
+                })
+            pagination_buttons.append({
+                "component": "VBtn",
+                "props": {
+                    "size": "x-small",
+                    "variant": "tonal" if number == page else "text",
+                    "color": "primary" if number == page else "default",
+                },
+                "text": str(number),
+                "events": page_action(
+                    "plugin/FFprobeMediaInfoPersistence/failed-extractions/view",
+                    {"state": state, "reason": reason, "page": number, "page_size": page_size},
+                ),
+            })
+            previous_page = number
+        pagination_buttons.append({
+            "component": "VBtn",
+            "props": {"size": "x-small", "variant": "text", "disabled": page >= page_count},
+            "text": "下一页",
+            "events": page_action(
+                "plugin/FFprobeMediaInfoPersistence/failed-extractions/view",
+                {"state": state, "reason": reason, "page": page + 1, "page_size": page_size},
+            ),
+        })
+        page_all_selected = bool(visible_records) and all(
+            record.get("selected") for record in visible_records
+        )
 
         table_rows: List[dict] = []
         for record in visible_records:
@@ -496,6 +592,19 @@ class FFprobeMediaInfoPersistence(_PluginBase):
             {"component": "div", "props": {"class": "d-flex flex-wrap ga-2 mt-3"}, "content": reason_buttons},
             {
                 "component": "div",
+                "props": {"class": "d-flex flex-wrap align-center ga-2 mt-3"},
+                "content": [
+                    {
+                        "component": "span",
+                        "props": {"class": "text-body-2"},
+                        "text": f"共 {total_records} 条，当前第 {page} / {page_count} 页",
+                    },
+                    *page_size_buttons,
+                    *pagination_buttons,
+                ],
+            },
+            {
+                "component": "div",
                 "props": {"class": "d-flex flex-wrap align-center ga-2 my-4"},
                 "content": [
                     {"component": "span", "props": {"class": "text-body-2"}, "text": f"已选 {selected_count} 项"},
@@ -516,6 +625,24 @@ class FFprobeMediaInfoPersistence(_PluginBase):
                         "props": {"variant": "text", "size": "small", "disabled": action_disabled},
                         "text": "取消选择",
                         "events": page_action("plugin/FFprobeMediaInfoPersistence/failed-extractions/clear-selection"),
+                    },
+                    {
+                        "component": "VBtn",
+                        "props": {"variant": "text", "size": "small", "disabled": retry_running or not visible_records},
+                        "text": "全选本页" if not page_all_selected else "取消本页全选",
+                        "events": page_action(
+                            "plugin/FFprobeMediaInfoPersistence/failed-extractions/select-scope",
+                            {"scope": "page", "selected": "0" if page_all_selected else "1"},
+                        ),
+                    },
+                    {
+                        "component": "VBtn",
+                        "props": {"variant": "text", "size": "small", "disabled": retry_running or not filtered_records},
+                        "text": "全选当前筛选",
+                        "events": page_action(
+                            "plugin/FFprobeMediaInfoPersistence/failed-extractions/select-scope",
+                            {"scope": "filtered", "selected": "1"},
+                        ),
                     },
                     {
                         "component": "VBtn",
@@ -542,7 +669,22 @@ class FFprobeMediaInfoPersistence(_PluginBase):
                 "props": {"density": "compact"},
                 "content": [
                     {"component": "thead", "content": [{"component": "tr", "content": [
-                        {"component": "th", "text": "选择"},
+                        {
+                            "component": "th",
+                            "content": [{
+                                "component": "VCheckbox",
+                                "props": {
+                                    "modelValue": page_all_selected,
+                                    "hideDetails": True,
+                                    "density": "compact",
+                                    "disabled": retry_running,
+                                },
+                                "events": page_action(
+                                    "plugin/FFprobeMediaInfoPersistence/failed-extractions/select-scope",
+                                    {"scope": "page", "selected": "0" if page_all_selected else "1"},
+                                ),
+                            }],
+                        },
                         {"component": "th", "text": "首次记录时间"},
                         {"component": "th", "text": "失败原因 / 大小信息"},
                         {"component": "th", "text": "尝试次数"},
@@ -572,6 +714,139 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         })
         return [{"component": "div", "props": {"class": "d-flex flex-column ga-3"}, "content": content}]
 
+    def get_failed_extractions_page(
+        self,
+        state: str = "pending",
+        reason: str = "",
+        page: int = 1,
+        page_size: int = _DEFAULT_FAILED_EXTRACTION_PAGE_SIZE,
+    ) -> Dict[str, Any]:
+        """仅返回当前页，供交互记录页按需加载，不持久化页面勾选状态。"""
+        normalized_state = type(self)._normalize_failed_extraction_state(state)
+        normalized_page_size = type(self)._normalize_failed_extraction_page_size(page_size)
+        normalized_page = max(1, type(self)._integer(page, 1) or 1)
+        with self._failed_extractions_lock:
+            records = self._failed_extractions()
+        state_records = type(self)._records_for_state(records, normalized_state)
+        filtered_records = type(self)._records_for_reason(state_records, str(reason or ""))
+        total = len(filtered_records)
+        page_count = max(1, (total + normalized_page_size - 1) // normalized_page_size)
+        normalized_page = min(normalized_page, page_count)
+        start = (normalized_page - 1) * normalized_page_size
+        visible_records = filtered_records[start:start + normalized_page_size]
+        return {
+            "state": normalized_state,
+            "reason": str(reason or ""),
+            "page": normalized_page,
+            "page_size": normalized_page_size,
+            "page_sizes": list(_FAILED_EXTRACTION_PAGE_SIZES),
+            "total": total,
+            "page_count": page_count,
+            "records": [type(self)._failed_extraction_page_record(record) for record in visible_records],
+            "reasons": sorted({str(record.get("reason") or "未知错误") for record in state_records}),
+            "counts": type(self)._failed_extraction_counts(records),
+            "progress": self._manual_retry_progress_snapshot(),
+            "progress_text": self._manual_retry_progress_text(),
+        }
+
+    def get_failed_extraction_ids(
+        self, state: str = "pending", reason: str = ""
+    ) -> Dict[str, Any]:
+        """只在用户点击“全选当前筛选”时读取 ID，避免每页响应重复传输全部 ID。"""
+        normalized_state = type(self)._normalize_failed_extraction_state(state)
+        with self._failed_extractions_lock:
+            records = self._failed_extractions()
+        filtered_records = type(self)._records_for_reason(
+            type(self)._records_for_state(records, normalized_state), str(reason or "")
+        )
+        return {"ids": [str(record["id"]) for record in filtered_records]}
+
+    @staticmethod
+    def _normalize_failed_extraction_state(state: Any) -> str:
+        value = str(state or "pending")
+        return value if value in {
+            "pending",
+            "handled",
+            _RECORD_CATEGORY_ABNORMAL_SIZE,
+            _RECORD_CATEGORY_ABNORMAL_SIZE_PENDING,
+        } else "pending"
+
+    @staticmethod
+    def _normalize_failed_extraction_page_size(value: Any) -> int:
+        parsed = FFprobeMediaInfoPersistence._integer(
+            value, _DEFAULT_FAILED_EXTRACTION_PAGE_SIZE
+        ) or _DEFAULT_FAILED_EXTRACTION_PAGE_SIZE
+        return parsed if parsed in _FAILED_EXTRACTION_PAGE_SIZES else _DEFAULT_FAILED_EXTRACTION_PAGE_SIZE
+
+    @staticmethod
+    def _failed_extraction_page_record(record: Dict[str, Any]) -> Dict[str, Any]:
+        """API 记录不携带旧静态页的 selected 字段，选择只保存于浏览器。"""
+        return {
+            key: record.get(key)
+            for key in (
+                "id", "destination", "first_failed_at", "reason", "attempt_count",
+                "handled", "category", "raw_size",
+            )
+        }
+
+    @staticmethod
+    def _failed_extraction_counts(records: List[Dict[str, Any]]) -> Dict[str, int]:
+        return {
+            "pending": sum(
+                1 for record in records
+                if record.get("category") == _RECORD_CATEGORY_FAILURE and not record.get("handled")
+            ),
+            "handled": sum(
+                1 for record in records
+                if record.get("category") == _RECORD_CATEGORY_FAILURE and record.get("handled")
+            ),
+            _RECORD_CATEGORY_ABNORMAL_SIZE: sum(
+                1 for record in records
+                if record.get("category") == _RECORD_CATEGORY_ABNORMAL_SIZE
+            ),
+            _RECORD_CATEGORY_ABNORMAL_SIZE_PENDING: sum(
+                1 for record in records
+                if record.get("category") == _RECORD_CATEGORY_ABNORMAL_SIZE_PENDING
+            ),
+        }
+
+    @staticmethod
+    def _payload_record_ids(payload: Any) -> set[str]:
+        """限制批量操作的输入为非空字符串 ID，忽略畸形请求。"""
+        if not isinstance(payload, dict):
+            return set()
+        raw_ids = payload.get("ids")
+        if not isinstance(raw_ids, list):
+            return set()
+        return {str(item) for item in raw_ids if str(item).strip()}
+
+    def retry_failed_extractions(self, payload: Optional[Dict[str, Any]] = None) -> Any:
+        """Vue 页面传入本地选中的 ID；不会把每次勾选写入插件数据。"""
+        record_ids = type(self)._payload_record_ids(payload)
+        if not record_ids:
+            return schemas.Response(success=False, message="请先选择至少一条失败记录")
+        with self._failed_extractions_lock:
+            selected_records = [
+                dict(record) for record in self._failed_extractions()
+                if str(record["id"]) in record_ids
+            ]
+        return self._submit_manual_retry_records(selected_records)
+
+    def delete_failed_extractions(self, payload: Optional[Dict[str, Any]] = None) -> Any:
+        """仅删除指定插件记录；不操作媒体文件、JSON 或整理历史。"""
+        record_ids = type(self)._payload_record_ids(payload)
+        if not record_ids:
+            return schemas.Response(success=False, message="请先选择至少一条记录")
+        if self._manual_retry_progress_snapshot().get("running"):
+            return schemas.Response(success=False, message="重新提取进行中，请完成后再删除记录")
+        with self._failed_extractions_lock:
+            records = self._failed_extractions()
+            kept_records = [record for record in records if str(record["id"]) not in record_ids]
+            deleted = len(records) - len(kept_records)
+            if deleted:
+                self._save_failed_extractions(kept_records)
+        return schemas.Response(success=True, message=f"已删除 {deleted} 条插件失败记录")
+
     @staticmethod
     def _failure_record_id(destination: str) -> str:
         return sha1(str(Path(destination)).casefold().encode("utf-8")).hexdigest()
@@ -581,6 +856,28 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         return "abnormal_size:" + sha1(
             str(Path(destination)).casefold().encode("utf-8")
         ).hexdigest()
+
+    @staticmethod
+    def _records_for_state(records: List[Dict[str, Any]], state: str) -> List[Dict[str, Any]]:
+        if state in {
+            _RECORD_CATEGORY_ABNORMAL_SIZE,
+            _RECORD_CATEGORY_ABNORMAL_SIZE_PENDING,
+        }:
+            return [record for record in records if record.get("category") == state]
+        return [
+            record for record in records
+            if record.get("category") == _RECORD_CATEGORY_FAILURE
+            and bool(record.get("handled")) == (state == "handled")
+        ]
+
+    @staticmethod
+    def _records_for_reason(
+        records: List[Dict[str, Any]], reason: str
+    ) -> List[Dict[str, Any]]:
+        return [
+            record for record in records
+            if not reason or record.get("reason") == reason
+        ]
 
     def _failed_extractions(self) -> List[Dict[str, Any]]:
         """读取并规范化失败提取记录，兼容旧数据或局部损坏数据。"""
@@ -615,9 +912,16 @@ class FFprobeMediaInfoPersistence(_PluginBase):
     def _save_failed_extractions(self, records: List[Dict[str, Any]]) -> None:
         self.save_data(_FAILED_EXTRACTIONS_DATA_KEY, records[-_MAX_FAILED_EXTRACTION_RECORDS:])
 
-    def _failed_extractions_view(self) -> Dict[str, str]:
+    def _failed_extractions_view(self) -> Dict[str, Any]:
         raw_view = self.get_data(_FAILED_EXTRACTIONS_VIEW_KEY) or {}
         state = str(raw_view.get("state") if isinstance(raw_view, dict) else "pending")
+        raw_page = type(self)._integer(
+            raw_view.get("page") if isinstance(raw_view, dict) else 1, 1
+        ) or 1
+        raw_page_size = type(self)._integer(
+            raw_view.get("page_size") if isinstance(raw_view, dict) else _DEFAULT_FAILED_EXTRACTION_PAGE_SIZE,
+            _DEFAULT_FAILED_EXTRACTION_PAGE_SIZE,
+        ) or _DEFAULT_FAILED_EXTRACTION_PAGE_SIZE
         return {
             "state": (
                 state
@@ -630,10 +934,27 @@ class FFprobeMediaInfoPersistence(_PluginBase):
                 else "pending"
             ),
             "reason": str(raw_view.get("reason") or "") if isinstance(raw_view, dict) else "",
+            "page": max(1, raw_page),
+            "page_size": (
+                raw_page_size
+                if raw_page_size in _FAILED_EXTRACTION_PAGE_SIZES
+                else _DEFAULT_FAILED_EXTRACTION_PAGE_SIZE
+            ),
         }
 
-    def _save_failed_extractions_view(self, state: str, reason: str) -> None:
-        self.save_data(_FAILED_EXTRACTIONS_VIEW_KEY, {"state": state, "reason": reason})
+    def _save_failed_extractions_view(
+        self, state: str, reason: str, page: int, page_size: int
+    ) -> None:
+        self.save_data(_FAILED_EXTRACTIONS_VIEW_KEY, {
+            "state": state,
+            "reason": reason,
+            "page": max(1, page),
+            "page_size": (
+                page_size
+                if page_size in _FAILED_EXTRACTION_PAGE_SIZES
+                else _DEFAULT_FAILED_EXTRACTION_PAGE_SIZE
+            ),
+        })
 
     @staticmethod
     def _api_authorized(apikey: Optional[str]) -> bool:
@@ -661,7 +982,12 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         return schemas.Response(success=found, message="已更新选择" if found else "未找到失败记录")
 
     def set_failed_extractions_view(
-        self, state: str = "pending", reason: str = "", apikey: Optional[str] = None
+        self,
+        state: str = "pending",
+        reason: str = "",
+        page: int = 1,
+        page_size: int = _DEFAULT_FAILED_EXTRACTION_PAGE_SIZE,
+        apikey: Optional[str] = None,
     ) -> Any:
         if not self._api_authorized(apikey):
             return self._api_denied()
@@ -674,13 +1000,56 @@ class FFprobeMediaInfoPersistence(_PluginBase):
             }
             else "pending"
         )
+        normalized_page = max(1, type(self)._integer(page, 1) or 1)
+        normalized_page_size = type(self)._integer(
+            page_size, _DEFAULT_FAILED_EXTRACTION_PAGE_SIZE
+        ) or _DEFAULT_FAILED_EXTRACTION_PAGE_SIZE
+        with self._failed_extractions_lock:
+            # 翻页、改每页数量或切换筛选条件都不清空勾选，便于跨页批量处理。
+            self._save_failed_extractions_view(
+                normalized_state, reason, normalized_page, normalized_page_size
+            )
+        return schemas.Response(success=True, message="已切换筛选条件")
+
+    def select_failed_extraction_scope(
+        self,
+        scope: str = "page",
+        selected: str = "1",
+        apikey: Optional[str] = None,
+    ) -> Any:
+        """批量选择当前页或当前筛选结果，避免逐条勾选造成重复刷新。"""
+        if not self._api_authorized(apikey):
+            return self._api_denied()
+        selected_value = str(selected).lower() in {"1", "true", "yes", "on"}
         with self._failed_extractions_lock:
             records = self._failed_extractions()
+            view = self._failed_extractions_view()
+            filtered = type(self)._records_for_reason(
+                type(self)._records_for_state(records, str(view["state"])),
+                str(view["reason"]),
+            )
+            if scope == "page":
+                page_size = int(view["page_size"])
+                page_count = max(1, (len(filtered) + page_size - 1) // page_size)
+                page = min(max(1, int(view["page"])), page_count)
+                start = (page - 1) * page_size
+                targets = filtered[start:start + page_size]
+            elif scope == "filtered":
+                targets = filtered
+            else:
+                return schemas.Response(success=False, message="未知选择范围")
+            target_ids = {str(record["id"]) for record in targets}
+            changed = 0
             for record in records:
-                record["selected"] = False
-            self._save_failed_extractions(records)
-            self._save_failed_extractions_view(normalized_state, reason)
-        return schemas.Response(success=True, message="已切换筛选条件")
+                if str(record["id"]) in target_ids and bool(record.get("selected")) != selected_value:
+                    record["selected"] = selected_value
+                    changed += 1
+            if changed:
+                self._save_failed_extractions(records)
+        return schemas.Response(
+            success=True,
+            message=f"已{'选择' if selected_value else '取消选择'} {len(target_ids)} 条记录",
+        )
 
     def clear_failed_extractions_selection(self, apikey: Optional[str] = None) -> Any:
         if not self._api_authorized(apikey):
@@ -733,15 +1102,19 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         """将已选失败记录交给现有主动提取线程池，接口立即返回、不阻塞页面。"""
         if not self._api_authorized(apikey):
             return self._api_denied()
+        with self._failed_extractions_lock:
+            selected_records = [
+                dict(record) for record in self._failed_extractions() if record.get("selected")
+            ]
+        return self._submit_manual_retry_records(selected_records)
+
+    def _submit_manual_retry_records(self, selected_records: List[Dict[str, Any]]) -> Any:
+        """将已确认的记录交给既有主动提取器；页面选择状态不参与后续执行。"""
         if not self._enabled:
             return schemas.Response(success=False, message="插件未启用，无法重新提取")
         executor = self._fallback_executor
         if executor is None:
             return schemas.Response(success=False, message="主动提取器未启动")
-        with self._failed_extractions_lock:
-            selected_records = [
-                dict(record) for record in self._failed_extractions() if record.get("selected")
-            ]
         if not selected_records:
             return schemas.Response(success=False, message="请先选择至少一条失败记录")
         with self._manual_retry_lock:
