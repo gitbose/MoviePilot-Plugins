@@ -728,7 +728,9 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         with self._failed_extractions_lock:
             records = self._failed_extractions()
         state_records = type(self)._records_for_state(records, normalized_state)
-        filtered_records = type(self)._records_for_reason(state_records, str(reason or ""))
+        filtered_records = type(self)._records_newest_first(
+            type(self)._records_for_reason(state_records, str(reason or ""))
+        )
         total = len(filtered_records)
         page_count = max(1, (total + normalized_page_size - 1) // normalized_page_size)
         normalized_page = min(normalized_page, page_count)
@@ -759,7 +761,12 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         filtered_records = type(self)._records_for_reason(
             type(self)._records_for_state(records, normalized_state), str(reason or "")
         )
-        return {"ids": [str(record["id"]) for record in filtered_records]}
+        return {
+            "ids": [
+                str(record["id"])
+                for record in type(self)._records_newest_first(filtered_records)
+            ]
+        }
 
     @staticmethod
     def _normalize_failed_extraction_state(state: Any) -> str:
@@ -879,6 +886,17 @@ class FFprobeMediaInfoPersistence(_PluginBase):
             if not reason or record.get("reason") == reason
         ]
 
+    @staticmethod
+    def _records_newest_first(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """记录页按首次记录时间倒序展示；不改变磁盘中的原始记录顺序。"""
+        return sorted(
+            records,
+            key=lambda record: (
+                str(record.get("first_failed_at") or ""), str(record.get("id") or ""),
+            ),
+            reverse=True,
+        )
+
     def _failed_extractions(self) -> List[Dict[str, Any]]:
         """读取并规范化失败提取记录，兼容旧数据或局部损坏数据。"""
         raw_records = self.get_data(_FAILED_EXTRACTIONS_DATA_KEY) or []
@@ -892,6 +910,7 @@ class FFprobeMediaInfoPersistence(_PluginBase):
             records.append({
                 "id": str(raw.get("id") or type(self)._failure_record_id(destination)),
                 "destination": destination,
+                "source_path": str(raw.get("source_path") or ""),
                 "first_failed_at": str(raw.get("first_failed_at") or "-"),
                 "reason": str(raw.get("reason") or "未知错误"),
                 "attempt_count": max(0, type(self)._integer(raw.get("attempt_count"), 0) or 0),
@@ -1161,7 +1180,11 @@ class FFprobeMediaInfoPersistence(_PluginBase):
                 if isinstance(probe, dict):
                     # 手动重新提取的目的是修复已记录项目，即使关闭全局覆盖也要写入新结果。
                     success = self._persist(
-                        destination, probe, "手动重新提取", force_overwrite=True
+                        destination,
+                        probe,
+                        "手动重新提取",
+                        force_overwrite=True,
+                        record_source_path=str(record.get("source_path") or "") or None,
                     )
                     if not success:
                         failure_reason = "JSON 写入失败"
@@ -1175,9 +1198,7 @@ class FFprobeMediaInfoPersistence(_PluginBase):
             # _persist 会按此次 ffprobe 的原始 Size 自动保留或移除异常大小记录。
             if not success:
                 self._mark_abnormal_size_retry_failed(record_id)
-        elif success:
-            self._remove_failed_extraction(record_id)
-        else:
+        elif not success:
             self._mark_manual_retry_failed(record_id, failure_reason)
         with self._manual_retry_lock:
             self._manual_retry_running_ids.discard(record_id)
@@ -1186,9 +1207,12 @@ class FFprobeMediaInfoPersistence(_PluginBase):
             if self._manual_retry_progress["completed"] >= self._manual_retry_progress["total"]:
                 self._manual_retry_progress["running"] = False
 
-    def _record_failed_extraction(self, destination: Path, reason: str) -> None:
+    def _record_failed_extraction(
+        self, destination: Path, reason: str, source_path: Optional[str] = None
+    ) -> None:
         """记录“上游缓存缺失且主动提取失败”的首次失败；保留首次失败时间。"""
         destination_text = str(destination)
+        source_text = str(source_path or "").strip()
         record_id = type(self)._failure_record_id(destination_text)
         with self._failed_extractions_lock:
             records = self._failed_extractions()
@@ -1198,11 +1222,14 @@ class FFprobeMediaInfoPersistence(_PluginBase):
                     and record.get("category") == _RECORD_CATEGORY_FAILURE
                 ):
                     record["reason"] = reason
+                    if source_text:
+                        record["source_path"] = source_text
                     self._save_failed_extractions(records)
                     return
             records.append({
                 "id": record_id,
                 "destination": destination_text,
+                "source_path": source_text,
                 "first_failed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "reason": reason,
                 "attempt_count": 0,
@@ -1231,13 +1258,37 @@ class FFprobeMediaInfoPersistence(_PluginBase):
     def _remove_failed_extraction(self, record_id: str) -> None:
         with self._failed_extractions_lock:
             records = self._failed_extractions()
-            self._save_failed_extractions([
+            remaining = [
                 record for record in records
                 if not (
                     record["id"] == record_id
                     and record.get("category") == _RECORD_CATEGORY_FAILURE
                 )
-            ])
+            ]
+            if len(remaining) != len(records):
+                self._save_failed_extractions(remaining)
+
+    def _clear_succeeded_failure(
+        self, destination: Path, source_path: Optional[str] = None
+    ) -> None:
+        """JSON 成功后清理同目标或同源文件的普通失败记录。"""
+        destination_id = type(self)._failure_record_id(str(destination))
+        source_key = type(self)._cache_key(source_path) if source_path else ""
+        with self._failed_extractions_lock:
+            records = self._failed_extractions()
+            remaining = []
+            for record in records:
+                is_failure = record.get("category") == _RECORD_CATEGORY_FAILURE
+                same_destination = str(record.get("id")) == destination_id
+                saved_source = str(record.get("source_path") or "")
+                same_source = bool(source_key and saved_source) and (
+                    type(self)._cache_key(saved_source) == source_key
+                )
+                if is_failure and (same_destination or same_source):
+                    continue
+                remaining.append(record)
+            if len(remaining) != len(records):
+                self._save_failed_extractions(remaining)
 
     def _record_abnormal_size(
         self, destination: Path, raw_size: int, generated: bool
@@ -1330,14 +1381,22 @@ class FFprobeMediaInfoPersistence(_PluginBase):
             self._cleanup_queue.clear()
             self._cleanup_condition.notify_all()
 
-    def _submit_cached_persist(self, destination: Path, probe: Dict[str, Any]) -> None:
+    def _submit_cached_persist(
+        self, destination: Path, probe: Dict[str, Any], source_path: Optional[str] = None
+    ) -> None:
         """命中缓存后立即提交独立写入池，不占用主动 ffprobe 并发。"""
         executor = self._cached_write_executor
         if executor is None:
             logger.warning("【ffprobe媒体信息持久化】JSON 写入器未启动，跳过：%s", destination)
             return
         try:
-            future = executor.submit(self._persist, destination, probe, "复用上游缓存")
+            future = executor.submit(
+                self._persist,
+                destination,
+                probe,
+                "复用上游缓存",
+                record_source_path=source_path,
+            )
         except RuntimeError:
             # 插件停用或重载时执行器可能刚好关闭；不让事件回调因此报错。
             logger.debug("【ffprobe媒体信息持久化】JSON 写入器已停止，跳过：%s", destination)
@@ -1354,14 +1413,18 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         except Exception as error:
             logger.warning("【ffprobe媒体信息持久化】后台 JSON 写入任务异常：%s", error)
 
-    def _submit_fallback_task(self, destination: Path) -> None:
+    def _submit_fallback_task(
+        self, destination: Path, source_path: Optional[str] = None
+    ) -> None:
         """提交后台兜底探测，不阻塞 MP 当前整理事件。"""
         executor = self._fallback_executor
         if executor is None:
             logger.warning("【ffprobe媒体信息持久化】后台提取器未启动，跳过：%s", destination)
             return
         try:
-            future = executor.submit(self._background_probe_and_persist, destination)
+            future = executor.submit(
+                self._background_probe_and_persist, destination, source_path
+            )
         except RuntimeError:
             logger.debug("【ffprobe媒体信息持久化】后台提取器已停止，跳过：%s", destination)
             return
@@ -1377,21 +1440,25 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         except Exception as error:
             logger.warning("【ffprobe媒体信息持久化】后台 MediaInfo 任务异常：%s", error)
 
-    def _background_probe_and_persist(self, destination: Path) -> None:
+    def _background_probe_and_persist(
+        self, destination: Path, source_path: Optional[str] = None
+    ) -> None:
         """对已整理到位的目标文件执行一次 10 秒兜底探测并写入 JSON。"""
         if not destination.is_file():
             logger.warning("【ffprobe媒体信息持久化】后台提取时目标不存在，跳过：%s", destination)
-            self._record_failed_extraction(destination, "整理目标不存在")
+            self._record_failed_extraction(destination, "整理目标不存在", source_path)
             return
         probe, failure_reason = type(self)._run_fallback_ffprobe_detail(
             str(destination), self._fallback_timeout
         )
         if not isinstance(probe, dict):
             logger.warning("【ffprobe媒体信息持久化】后台 ffprobe 未得到结果，跳过：%s", destination)
-            self._record_failed_extraction(destination, failure_reason)
+            self._record_failed_extraction(destination, failure_reason, source_path)
             return
-        if not self._persist(destination, probe, "主动提取"):
-            self._record_failed_extraction(destination, "JSON 写入失败")
+        if not self._persist(
+            destination, probe, "主动提取", record_source_path=source_path
+        ):
+            self._record_failed_extraction(destination, "JSON 写入失败", source_path)
 
     def _clear_pending_probes(self) -> None:
         with self._pending_probes_lock:
@@ -1823,12 +1890,12 @@ class FFprobeMediaInfoPersistence(_PluginBase):
                 probe = type(self)._get_cached_probe(source_path)
             if not isinstance(probe, dict):
                 if self._fallback_probe:
-                    self._submit_fallback_task(destination)
+                    self._submit_fallback_task(destination, source_path)
                 else:
                     logger.warning("【ffprobe媒体信息持久化】没有可复用的 ffprobe 结果，跳过：%s", destination)
                 return
             # 命中缓存的 JSON 写入不受 ffprobe 兜底线程数限制；每条整理记录自行完成。
-            self._submit_cached_persist(destination, probe)
+            self._submit_cached_persist(destination, probe, source_path)
         finally:
             # 清理放在该条整理记录的处理末尾；不受生成 JSON 筛选条件影响。
             self._schedule_source_json_cleanup(source_path)
@@ -1839,6 +1906,7 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         probe: Dict[str, Any],
         source: str,
         force_overwrite: bool = False,
+        record_source_path: Optional[str] = None,
     ) -> bool:
         if not destination.is_file():
             logger.warning("【ffprobe媒体信息持久化】整理目标不存在，跳过：%s", destination)
@@ -1847,6 +1915,7 @@ class FFprobeMediaInfoPersistence(_PluginBase):
         if raw_size is not None and not self._allow_abnormal_size_json:
             # 这是受配置控制的正常拦截，不应再记录为“JSON 写入失败”。
             self._record_abnormal_size(destination, raw_size, generated=False)
+            self._clear_succeeded_failure(destination, record_source_path)
             logger.info(
                 "【ffprobe媒体信息持久化】检测到异常 Size=%s，按配置不生成 JSON：%s",
                 raw_size,
@@ -1863,6 +1932,8 @@ class FFprobeMediaInfoPersistence(_PluginBase):
             self._writing_json_paths.add(path_key)
         try:
             if json_path.exists() and not (self._overwrite_json or force_overwrite):
+                # 已有 JSON 也表明本次 ffprobe 成功；旧失败记录不应继续保留。
+                self._clear_succeeded_failure(destination, record_source_path)
                 logger.info("【ffprobe媒体信息持久化】JSON 已存在，按配置不覆盖：%s", json_path)
                 return True
             document = type(self)._to_emby_document(probe)
@@ -1876,6 +1947,7 @@ class FFprobeMediaInfoPersistence(_PluginBase):
                 self._remove_abnormal_size(destination)
             else:
                 self._record_abnormal_size(destination, raw_size, generated=True)
+            self._clear_succeeded_failure(destination, record_source_path)
             logger.info("【ffprobe媒体信息持久化】已保存 MediaInfo JSON（%s）：%s", source, json_path)
             return True
         except OSError as error:
