@@ -1,10 +1,12 @@
 <script setup>
-import { onMounted, ref } from 'vue'
+import { onMounted, onUnmounted, ref } from 'vue'
 
 const props = defineProps({
   initialConfig: { type: Object, default: () => ({}) },
 })
 const emit = defineEmits(['save'])
+const configRoot = ref(null)
+let dialogStyleSnapshot = []
 
 const config = ref({
   enabled: false,
@@ -26,23 +28,52 @@ function save() {
   emit('save', { ...config.value, fallback_workers: workers, fallback_timeout: timeout })
 }
 
+function setInlineStyle(element, property, value) {
+  dialogStyleSnapshot.push({
+    element,
+    property,
+    value: element.style.getPropertyValue(property),
+    priority: element.style.getPropertyPriority(property),
+  })
+  element.style.setProperty(property, value, 'important')
+}
+
+function expandHostDialog() {
+  const root = configRoot.value
+  const content = root?.closest?.('.v-overlay__content')
+  if (!content) return
+  setInlineStyle(content, 'width', 'min(calc(100vw - 32px), calc(60rem + 48px))')
+  setInlineStyle(content, 'max-width', 'calc(60rem + 48px)')
+  const card = root.closest?.('.v-card')
+  if (card) setInlineStyle(card, 'width', '100%')
+}
+
+function restoreHostDialog() {
+  for (const item of dialogStyleSnapshot.reverse()) {
+    item.element.style.setProperty(item.property, item.value, item.priority)
+  }
+  dialogStyleSnapshot = []
+}
+
 onMounted(() => {
-  // 配置内容四周的安全留白由宿主卡片额外扩出的空间承载，不压缩原有输入区域。
   emit('layout', { maxWidth: 'calc(60rem + 48px)' })
+  requestAnimationFrame(expandHostDialog)
 })
+onUnmounted(restoreHostDialog)
 </script>
 
 <template>
-  <div class="ffprobe-config plugin-root">
-    <v-row>
+  <div ref="configRoot" class="ffprobe-config plugin-root">
+    <div class="config-scroll">
+      <v-row>
       <v-col cols="12" md="6">
         <v-switch v-model="config.enabled" label="启用插件" hint="开启后监听媒体整理事件并写入 MediaInfo JSON。" persistent-hint />
       </v-col>
       <v-col cols="12" md="6">
         <v-switch v-model="config.cleanup_moved_source_json" label="清理已搬离源文件的同名 MediaInfo JSON" hint="整理完成 10 秒后，媒体文件若被删除，则删除同目录下严格同名的 JSON 文件。" persistent-hint />
       </v-col>
-    </v-row>
-    <div class="config-lower">
+      </v-row>
+      <div class="config-lower">
       <v-row>
         <v-col cols="12" md="4">
           <v-switch v-model="config.fallback_probe" label="上游缓存缺失时主动提取" hint="仅缓存未命中时，对整理后的目标文件执行 ffprobe；任务在后台运行。" persistent-hint />
@@ -77,13 +108,15 @@ onMounted(() => {
       </v-row>
       <v-alert type="info" variant="tonal" density="compact" class="mb-3">使用说明：优先复用“ffprobe命名补充”已获取的缓存，缓存命中后立即后台写入 JSON，最多 32 个并发。仅缓存缺失时才按“主动提取”配置对最终目标文件运行 ffprobe。上游 ffprobe 未请求章节，因此输出 JSON 的 Chapters 为空。</v-alert>
       <v-alert type="warning" variant="tonal" density="compact">JSON清理：文件整理完成后延迟 10 秒检查，若媒体文件已不存在，则清理媒体文件目录下严格同名的 -mediainfo.json 文件。</v-alert>
+      </div>
     </div>
     <div class="d-flex justify-end mt-5"><v-btn color="primary" @click="save">保存</v-btn></div>
   </div>
 </template>
 
 <style scoped>
-.ffprobe-config { box-sizing: border-box; padding: 20px 24px 24px; }
+.ffprobe-config { box-sizing: border-box; display: flex; flex-direction: column; height: min(78vh, 52rem); overflow: hidden; padding: 20px 24px 24px; }
+.config-scroll { flex: 1 1 auto; min-height: 0; overflow-x: hidden; overflow-y: auto; }
 .ffprobe-config :deep(.v-messages__message) { line-height: 1rem; }
 .config-lower { margin-top: -10px; }
 @media (max-width: 600px) {
