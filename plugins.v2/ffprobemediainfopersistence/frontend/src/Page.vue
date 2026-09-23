@@ -1,5 +1,5 @@
 <script setup>
-import { computed, inject, onMounted, ref } from 'vue'
+import { computed, inject, onMounted, onUnmounted, ref } from 'vue'
 
 const props = defineProps({
   api: { type: Object, default: () => ({}) },
@@ -27,6 +27,8 @@ const notice = ref('')
 const selectedIds = ref(new Set())
 const requestedPage = ref('')
 const currentFilterIds = ref(new Set())
+const pageRoot = ref(null)
+let dialogStyleSnapshot = []
 
 const statusTabs = computed(() => [
   { key: 'pending', label: '未处理', count: counts.value.pending || 0 },
@@ -206,11 +208,43 @@ function rowDetail(row) {
   return row.reason || '未知错误'
 }
 
-onMounted(() => loadPage())
+function setInlineStyle(element, property, value) {
+  const prior = {
+    element,
+    property,
+    value: element.style.getPropertyValue(property),
+    priority: element.style.getPropertyPriority(property),
+  }
+  dialogStyleSnapshot.push(prior)
+  element.style.setProperty(property, value, 'important')
+}
+
+function expandHostDialog() {
+  const root = pageRoot.value
+  const content = root?.closest?.('.v-overlay__content')
+  if (!content) return
+  setInlineStyle(content, 'width', 'min(calc(100vw - 32px), calc(80rem + 48px))')
+  setInlineStyle(content, 'max-width', 'calc(80rem + 48px)')
+  const card = root.closest?.('.v-card')
+  if (card) setInlineStyle(card, 'width', '100%')
+}
+
+function restoreHostDialog() {
+  for (const item of dialogStyleSnapshot.reverse()) {
+    item.element.style.setProperty(item.property, item.value, item.priority)
+  }
+  dialogStyleSnapshot = []
+}
+
+onMounted(() => {
+  loadPage()
+  requestAnimationFrame(expandHostDialog)
+})
+onUnmounted(restoreHostDialog)
 </script>
 
 <template>
-  <div class="ffprobe-records plugin-root">
+  <div ref="pageRoot" class="ffprobe-records plugin-root">
     <v-alert type="info" variant="tonal" density="compact" class="mb-3">
       所有任务后台运行，关闭此页面不影响执行；删除记录仅移除当前页面的运行记录；异常大小栏是 <strong>ffprobe </strong>读取后，json信息的 Size &lt; 1MB 的文件记录
     </v-alert>
@@ -306,12 +340,10 @@ onMounted(() => loadPage())
 </template>
 
 <style scoped>
-.ffprobe-records { box-sizing: border-box; min-width: 0; padding: 20px 24px 24px; }
-/* MP V2 的详情弹窗默认上限为 80rem；多出的 48px 专用于容纳安全留白。 */
-:global(.v-overlay__content:has(.ffprobe-records)) {
-  width: min(calc(100vw - 32px), calc(80rem + 48px)) !important;
-  max-width: calc(80rem + 48px) !important;
-}
+.ffprobe-records { box-sizing: border-box; display: flex; flex-direction: column; height: min(78vh, 52rem); min-width: 0; overflow: hidden; padding: 20px 24px 24px; }
+.records-table { display: flex; flex: 1 1 auto; min-height: 0; }
+.records-table :deep(.v-table__wrapper) { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+.records-table :deep(thead th) { background: rgb(var(--v-theme-surface)); position: sticky; top: 0; z-index: 1; }
 .page-size { width: 116px; }
 .goto-page { width: 112px; }
 .path-cell { max-width: 520px; overflow-wrap: anywhere; }
