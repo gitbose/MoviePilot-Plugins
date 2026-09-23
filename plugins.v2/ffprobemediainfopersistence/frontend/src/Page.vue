@@ -306,8 +306,16 @@ onMounted(() => loadPage())
 </template>
 
 <style scoped>
-.ffprobe-records { min-width: 0; }
+.ffprobe-records { box-sizing: border-box; min-width: 0; padding: 20px 24px 24px; }
+/* MP V2 的详情弹窗默认上限为 80rem；多出的 48px 专用于容纳安全留白。 */
+:global(.v-overlay__content:has(.ffprobe-records)) {
+  width: min(calc(100vw - 32px), calc(80rem + 48px)) !important;
+  max-width: calc(80rem + 48px) !important;
+}
 .page-size { width: 116px; }
 .goto-page { width: 112px; }
 .path-cell { max-width: 520px; overflow-wrap: anywhere; }
+@media (max-width: 600px) {
+  .ffprobe-records { padding: 16px; }
+}
 </style>
