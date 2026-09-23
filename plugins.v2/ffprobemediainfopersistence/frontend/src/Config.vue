@@ -1,5 +1,5 @@
 <script setup>
-import { ref } from 'vue'
+import { onMounted, ref } from 'vue'
 
 const props = defineProps({
   initialConfig: { type: Object, default: () => ({}) },
@@ -25,6 +25,11 @@ function save() {
   const timeout = Math.min(300, Math.max(1, Number(config.value.fallback_timeout) || 10))
   emit('save', { ...config.value, fallback_workers: workers, fallback_timeout: timeout })
 }
+
+onMounted(() => {
+  // 配置内容四周的安全留白由宿主卡片额外扩出的空间承载，不压缩原有输入区域。
+  emit('layout', { maxWidth: 'calc(60rem + 48px)' })
+})
 </script>
 
 <template>
@@ -78,6 +83,10 @@ function save() {
 </template>
 
 <style scoped>
+.ffprobe-config { box-sizing: border-box; padding: 20px 24px 24px; }
 .ffprobe-config :deep(.v-messages__message) { line-height: 1rem; }
 .config-lower { margin-top: -10px; }
+@media (max-width: 600px) {
+  .ffprobe-config { padding: 16px; }
+}
 </style>
