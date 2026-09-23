@@ -3,11 +3,12 @@
     "name": "ffprobe媒体信息持久化",
     "description": "复用 ffprobe命名补充的媒体信息并持久化为 Emby MediaInfo JSON。",
     "labels": "ffprobe, Emby, 媒体信息",
-    "version": "1.1.1",
+    "version": "1.1.2",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/refs/heads/main/icons/ffmpeg.png",
     "author": "gitbose",
     "level": 1,
     "history": {
+      "v1.1.2": "重新构建完整联邦前端资源，修复组件加载错误",
       "v1.1": "优化失败记录页面与批量处理体验",
       "v1.0.0": "复用 ffprobe命名补充缓存，整理后写入 Emby MediaInfo JSON。"
     }
