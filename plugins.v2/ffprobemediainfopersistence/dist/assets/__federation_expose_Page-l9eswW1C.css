@@ -1,0 +1,21 @@
+
+.ffprobe-records[data-v-8d391564] { box-sizing: border-box; display: flex; flex-direction: column; position: relative; height: min(88vh, 60rem); min-width: 0; overflow: hidden; padding: 20px 72px 24px 24px;
+}
+.plugin-close-button[data-v-8d391564] { position: absolute; top: 8px; right: 8px; z-index: 2;
+}
+.records-table[data-v-8d391564] { display: flex; flex: 1 1 auto; min-height: 0;
+}
+.records-table[data-v-8d391564] .v-table__wrapper { flex: 1 1 auto; min-height: 0; overflow-y: auto;
+}
+.records-table[data-v-8d391564] thead th { background: rgb(var(--v-theme-surface)); position: sticky; top: 0; z-index: 1;
+}
+.page-size[data-v-8d391564] { width: 116px;
+}
+.goto-page[data-v-8d391564] { width: 112px;
+}
+.path-cell[data-v-8d391564] { max-width: 520px; overflow-wrap: anywhere;
+}
+@media (max-width: 600px) {
+.ffprobe-records[data-v-8d391564] { padding: 16px 56px 16px 16px;
+}
+}
