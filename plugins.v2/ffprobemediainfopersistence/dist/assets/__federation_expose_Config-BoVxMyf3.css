@@ -1,0 +1,19 @@
+
+.ffprobe-config[data-v-e4a74687] { box-sizing: border-box; display: flex; flex-direction: column; position: relative; height: min(calc(100vh - 48px), 62.5rem); overflow: hidden; padding: 20px 24px 24px;
+}
+.plugin-page-title[data-v-e4a74687] { position: absolute; top: 16px; left: 24px; font-size: 1.125rem; font-weight: 600; line-height: 1.5rem;
+}
+.plugin-close-button[data-v-e4a74687] { position: absolute; top: 8px; right: 8px; z-index: 2;
+}
+.config-scroll[data-v-e4a74687] { flex: 1 1 auto; min-height: 0; margin-top: 32px; overflow-x: hidden; overflow-y: auto;
+}
+.ffprobe-config[data-v-e4a74687] .v-messages__message { line-height: 1rem;
+}
+.config-lower[data-v-e4a74687] { margin-top: -10px;
+}
+@media (max-width: 600px) {
+.ffprobe-config[data-v-e4a74687] { padding: 16px;
+}
+.plugin-page-title[data-v-e4a74687] { top: 12px; left: 16px;
+}
+}
